@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "training-control": {
+      "type": "local",
+      "command": "python",
+      "args": ["-m", "agentic_optimizer.mcp_server"],
+      "env": {
+        "CONTROL_PLANE_URL": "http://127.0.0.1:8765",
+        "CONTROL_PLANE_TOKEN": "",
+        "CONTROL_PLANE_RUN_ID": "default"
+      },
+      "tools": ["*"]
+    }
+  }
+}

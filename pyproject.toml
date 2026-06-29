@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-optimizer"
+version = "0.1.0"
+description = "Use the GitHub Copilot CLI as an in-the-loop agentic optimizer for PyTorch training."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2",
+    "httpx>=0.26",
+]
+
+[project.optional-dependencies]
+# The broker host needs FastAPI/uvicorn; the local MCP side needs `mcp`; the training node needs
+# neither (only pydantic+httpx, plus torch). Split so each role installs a minimal set.
+broker = ["fastapi>=0.110", "uvicorn>=0.27"]
+mcp = ["mcp>=1.2"]
+hpo = ["optuna>=3"]
+gpu = ["nvidia-ml-py>=12"]
+torch = ["torch", "torchvision"]
+mlflow = ["mlflow"]
+all = ["agentic-optimizer[broker,mcp,hpo,gpu,mlflow]"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "mcp>=1.2",
+    "optuna>=3",
+    "nvidia-ml-py>=12",
+]
+
+[project.scripts]
+agentic-optimizer-mcp = "agentic_optimizer.mcp_server:main"
+agentic-optimizer-broker = "agentic_optimizer.controlplane:_run_cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

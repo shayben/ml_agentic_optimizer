@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CONTROL_PLANE_HOST=0.0.0.0 \
+    CONTROL_PLANE_PORT=8765
+
+WORKDIR /app
+COPY . /app
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install ".[broker]"
+
+EXPOSE 8765
+
+# Reads CONTROL_PLANE_TOKEN, CONTROL_PLANE_PERSIST, CONTROL_PLANE_MAX_BODY_BYTES,
+# CONTROL_PLANE_HOST, CONTROL_PLANE_PORT, and CONTROL_PLANE_INSECURE from env.
+CMD ["agentic-optimizer-broker"]

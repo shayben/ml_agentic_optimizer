@@ -1,0 +1,16 @@
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CONTROL_PLANE_RUN_ID=default
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install ".[torch,gpu,mlflow]"
+
+# Copilot CLI is intentionally not installed here; it runs locally with MCP stdio.
+# The training script reads CONTROL_PLANE_URL, CONTROL_PLANE_TOKEN, and CONTROL_PLANE_RUN_ID.
+CMD ["bash", "-lc", "python examples/train_with_bridge.py --broker ${CONTROL_PLANE_URL:?set CONTROL_PLANE_URL}"]

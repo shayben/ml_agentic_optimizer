@@ -1,0 +1,32 @@
+# Azure ML v2 command job that runs the TrainingBridge on a remote node.
+# Submit with: az ml job create -f examples/aml_job.yml
+#
+# Topology:
+# - The broker is hosted separately (for example docker/Dockerfile.broker behind TLS or an SSH tunnel).
+# - This AML job runs only the PyTorch training process + TrainingBridge and points it at the broker.
+# - The local GitHub Copilot CLI connects to the same broker through agent/mcp-config.json.
+# - Legacy file-contract / on-node agent examples are secondary; do not run Copilot CLI in this job.
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+display_name: agentic-optimizer-bridge
+experiment_name: agentic-optimizer
+
+# Use docker/Dockerfile.node pushed to your registry, or a curated PyTorch environment.
+environment: azureml:agentic-optimizer-node@latest
+
+code: ..
+compute: azureml:gpu-cluster
+
+command: >-
+  pip install -e ".[torch,gpu,mlflow]" &&
+  python examples/train_with_bridge.py
+  --broker $CONTROL_PLANE_URL
+
+environment_variables:
+  CONTROL_PLANE_URL: https://<broker-host>
+  CONTROL_PLANE_TOKEN: ${{secrets.control-plane-token}}
+  CONTROL_PLANE_RUN_ID: aml-run-001
+
+outputs:
+  outputs:
+    type: uri_folder

@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# secrets / tokens — never commit
+*.token
+*token*.txt
+secrets/
+copilot_token*
+
+# runtime artifacts produced by the optimizer loop
+state.json
+control.json
+runs/
+*.log
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
