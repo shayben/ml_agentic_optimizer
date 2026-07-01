@@ -595,7 +595,13 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
     parser.add_argument("--host", default=os.environ.get("CONTROL_PLANE_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CONTROL_PLANE_PORT", "8765")))
     parser.add_argument("--devtunnel-cmd", default="devtunnel")
-    parser.add_argument("--tunnel-id", default=os.environ.get("CONTROL_PLANE_TUNNEL_ID"))
+    parser.add_argument(
+        "--tunnel-id",
+        default=os.environ.get("CONTROL_PLANE_TUNNEL_ID"),
+        help="Host a persistent (named) Dev Tunnel with a STABLE public URL so the node's "
+        "CONTROL_PLANE_URL stays constant across broker restarts (no config churn). "
+        "Defaults to $CONTROL_PLANE_TUNNEL_ID. Requires --tunnel.",
+    )
     args = parser.parse_args()
 
     host = args.host
@@ -607,6 +613,11 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
         host=host,
         insecure=os.environ.get("CONTROL_PLANE_INSECURE") == "1",
     )
+    if args.tunnel_id and not args.tunnel:
+        logger.warning(
+            "--tunnel-id/$CONTROL_PLANE_TUNNEL_ID is ignored without --tunnel; "
+            "add --tunnel to host the persistent Dev Tunnel."
+        )
     persist_path = os.environ.get("CONTROL_PLANE_PERSIST")
     max_body_bytes = int(os.environ.get("CONTROL_PLANE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
     app = create_app(
@@ -626,6 +637,17 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
             "Use the Dev Tunnel public URL as CONTROL_PLANE_URL on the remote node; "
             "the bearer token is still required when configured."
         )
+        if args.tunnel_id:
+            logger.info(
+                "Persistent Dev Tunnel '%s': its public URL is stable across restarts, so the "
+                "node's CONTROL_PLANE_URL can be set once and left unchanged.",
+                args.tunnel_id,
+            )
+        else:
+            logger.info(
+                "Temporary Dev Tunnel: the public URL changes each run. Pass --tunnel-id "
+                "(or $CONTROL_PLANE_TUNNEL_ID) for a stable URL."
+            )
         serve_with_tunnel(app, tunnel_host, port, cmd=args.devtunnel_cmd, tunnel_id=args.tunnel_id)
         return
 

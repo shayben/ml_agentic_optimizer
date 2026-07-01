@@ -92,9 +92,11 @@ If installed with `[hpo]`, optional advisor tools are also available: `hpo_confi
 
 ```bash
 # 1) broker — runs locally and publishes itself via Dev Tunnel (needs the `devtunnel` CLI).
-#    Prints a public HTTPS URL for the node to use as <broker-url> below. No 3rd endpoint to host.
+#    Use --tunnel-id for a PERSISTENT tunnel: the public <broker-url> is then stable across
+#    restarts, so the node's CONTROL_PLANE_URL is set once. No 3rd endpoint to host.
 pip install -e ".[broker]"
-CONTROL_PLANE_TOKEN=<strong-token> agentic-optimizer-broker --tunnel
+CONTROL_PLANE_TOKEN=<strong-token> agentic-optimizer-broker --tunnel --tunnel-id my-stable-id
+#   (omit --tunnel-id for a throwaway tunnel whose URL changes every run)
 # Alternative — self-host a fixed, reachable broker instead of a tunnel:
 #   CONTROL_PLANE_TOKEN=<strong-token> CONTROL_PLANE_HOST=0.0.0.0 agentic-optimizer-broker
 

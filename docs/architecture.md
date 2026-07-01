@@ -141,7 +141,10 @@ AML secrets, or an equivalent secret manager. The broker uses constant-time toke
 To avoid hosting a separate reachable endpoint, `agentic-optimizer-broker --tunnel` binds the broker to localhost
 and publishes a public HTTPS URL through Microsoft Dev Tunnels (`agentic_optimizer.tunnel`, requires the
 `devtunnel` CLI). The printed URL becomes the node's `CONTROL_PLANE_URL`; always pair it with a strong token since
-the tunnel is internet-reachable.
+the tunnel is internet-reachable. By default the tunnel is temporary and its URL changes each run; pass
+`--tunnel-id <id>` (or `$CONTROL_PLANE_TUNNEL_ID`) to ensure/host a **persistent named tunnel** with a stable URL
+(`https://<id>-<port>.<cluster>.devtunnels.ms`) so `CONTROL_PLANE_URL` and the MCP config stay static across
+broker restarts.
 
 The broker stores telemetry and small command/result payloads, not model weights. Custom interrogation handlers
 decide what data/model details are exposed; keep results free of sensitive raw data.

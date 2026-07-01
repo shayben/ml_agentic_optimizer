@@ -120,7 +120,9 @@ entry point — see the conventions below.
 
 - Local + node clients: `CONTROL_PLANE_URL`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_RUN_ID`.
 - Broker: `CONTROL_PLANE_HOST`, `CONTROL_PLANE_PORT`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_PERSIST`,
-  `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1`. Broker startup (`controlplane._check_exposure`)
+  `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1`, `CONTROL_PLANE_TUNNEL_ID` (persistent named Dev
+  Tunnel → stable public URL for `--tunnel`, so the node/MCP config stays static across restarts). Broker startup
+  (`controlplane._check_exposure`)
   **refuses** to serve an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind
   (anyone reachable could drive the run); set `CONTROL_PLANE_TOKEN`, or `CONTROL_PLANE_INSECURE=1` to override
   (unsafe). A loopback bind with no token is allowed.
