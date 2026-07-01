@@ -271,7 +271,9 @@ namespaced by it, so many training jobs can share one broker. The agent calls `l
   localhost *and* publish a public HTTPS URL through Microsoft Dev Tunnels (requires the `devtunnel` CLI). The
   printed URL is what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Because a
   tunnel is public, the broker **requires** `CONTROL_PLANE_TOKEN` for `--tunnel` (override with
-  `CONTROL_PLANE_INSECURE=1`, unsafe).
+  `CONTROL_PLANE_INSECURE=1`, unsafe). By default this is an ephemeral tunnel with a new URL each restart; use
+  `--tunnel-id <id>` or `CONTROL_PLANE_TUNNEL_ID=<id>` to ensure and host a persistent named tunnel whose HTTPS URL
+  stays stable across broker restarts.
 
 ## Containers
 

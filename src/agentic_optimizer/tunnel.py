@@ -37,6 +37,44 @@ def build_host_command(
     return argv
 
 
+def build_named_host_command(
+    tunnel_id: str, *, allow_anonymous: bool = True, cmd: str = "devtunnel"
+) -> list[str]:
+    """Build ``devtunnel host <TUNNEL_ID>`` argv for an existing named tunnel."""
+    argv = [cmd, "host", tunnel_id]
+    if allow_anonymous:
+        argv.append("--allow-anonymous")
+    return argv
+
+
+def ensure_named_tunnel(
+    tunnel_id: str,
+    port: int,
+    *,
+    allow_anonymous: bool = True,
+    cmd: str = "devtunnel",
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Ensure a persistent Dev Tunnel and forwarded port exist."""
+    create_argv = [cmd, "create", tunnel_id]
+    if allow_anonymous:
+        create_argv.append("--allow-anonymous")
+    port_argv = [cmd, "port", "create", tunnel_id, "-p", str(port)]
+
+    for argv in (create_argv, port_argv):
+        result = run(argv, capture_output=True, text=True)
+        if result.returncode == 0 or _already_exists(result):
+            continue
+        stderr = (result.stderr or result.stdout or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise TunnelError(f"Dev Tunnel command failed ({' '.join(argv)}){detail}")
+
+
+def _already_exists(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stderr or ''}\n{result.stdout or ''}"
+    return result.returncode != 0 and "already exists" in output.lower()
+
+
 def parse_tunnel_url(line: str) -> str | None:
     """Extract the first public ``https://*.devtunnels.ms`` URL from a devtunnel line."""
     match = _DEV_TUNNEL_URL_RE.search(line)
@@ -54,13 +92,17 @@ class DevTunnel:
         *,
         allow_anonymous: bool = True,
         cmd: str = "devtunnel",
+        tunnel_id: str | None = None,
         popen: Callable[..., Any] = subprocess.Popen,
+        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout: float = 30.0,
     ) -> None:
         self.port = port
         self.allow_anonymous = allow_anonymous
         self.cmd = cmd
+        self.tunnel_id = tunnel_id
         self.popen = popen
+        self.run = run
         self.timeout = timeout
         self.url: str | None = None
         self.proc: Any | None = None
@@ -75,9 +117,21 @@ class DevTunnel:
                 "or pass --devtunnel-cmd with the CLI path."
             )
 
-        argv = build_host_command(
-            self.port, allow_anonymous=self.allow_anonymous, cmd=self.cmd
-        )
+        if self.tunnel_id is not None:
+            ensure_named_tunnel(
+                self.tunnel_id,
+                self.port,
+                allow_anonymous=self.allow_anonymous,
+                cmd=self.cmd,
+                run=self.run,
+            )
+            argv = build_named_host_command(
+                self.tunnel_id, allow_anonymous=self.allow_anonymous, cmd=self.cmd
+            )
+        else:
+            argv = build_host_command(
+                self.port, allow_anonymous=self.allow_anonymous, cmd=self.cmd
+            )
         try:
             self.proc = self.popen(
                 argv,
@@ -173,10 +227,16 @@ class DevTunnel:
 
 
 def serve_with_tunnel(
-    app: object, host: str, port: int, *, cmd: str = "devtunnel", allow_anonymous: bool = True
+    app: object,
+    host: str,
+    port: int,
+    *,
+    cmd: str = "devtunnel",
+    tunnel_id: str | None = None,
+    allow_anonymous: bool = True,
 ) -> None:  # pragma: no cover - thin server wrapper
     """Serve the broker with a Microsoft Dev Tunnel forwarding public HTTPS traffic."""
-    tunnel = DevTunnel(port, cmd=cmd, allow_anonymous=allow_anonymous)
+    tunnel = DevTunnel(port, cmd=cmd, tunnel_id=tunnel_id, allow_anonymous=allow_anonymous)
     try:
         url = tunnel.start()
         logger.info("Dev Tunnel public URL: %s", url)

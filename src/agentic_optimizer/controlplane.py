@@ -595,6 +595,7 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
     parser.add_argument("--host", default=os.environ.get("CONTROL_PLANE_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CONTROL_PLANE_PORT", "8765")))
     parser.add_argument("--devtunnel-cmd", default="devtunnel")
+    parser.add_argument("--tunnel-id", default=os.environ.get("CONTROL_PLANE_TUNNEL_ID"))
     args = parser.parse_args()
 
     host = args.host
@@ -625,7 +626,7 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
             "Use the Dev Tunnel public URL as CONTROL_PLANE_URL on the remote node; "
             "the bearer token is still required when configured."
         )
-        serve_with_tunnel(app, tunnel_host, port, cmd=args.devtunnel_cmd)
+        serve_with_tunnel(app, tunnel_host, port, cmd=args.devtunnel_cmd, tunnel_id=args.tunnel_id)
         return
 
     logger.info("control plane on http://%s:%s (auth: %s)", host, port, "on" if token else "off")

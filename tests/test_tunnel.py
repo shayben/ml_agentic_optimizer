@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import threading
 
 import pytest
@@ -9,7 +10,9 @@ from agentic_optimizer.tunnel import (
     DevTunnel,
     TunnelError,
     build_host_command,
+    build_named_host_command,
     devtunnel_available,
+    ensure_named_tunnel,
     parse_tunnel_url,
 )
 
@@ -101,6 +104,30 @@ def test_build_host_command_without_anonymous_and_custom_cmd() -> None:
     ]
 
 
+def test_build_named_host_command_defaults() -> None:
+    assert build_named_host_command("stable-id") == [
+        "devtunnel",
+        "host",
+        "stable-id",
+        "--allow-anonymous",
+    ]
+
+
+def test_ensure_named_tunnel_creates_tunnel_and_port_tolerating_existing() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="already exists")
+
+    ensure_named_tunnel("stable-id", 8765, run=run)
+
+    assert calls == [
+        ["devtunnel", "create", "stable-id", "--allow-anonymous"],
+        ["devtunnel", "port", "create", "stable-id", "-p", "8765"],
+    ]
+
+
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
@@ -151,6 +178,30 @@ def test_dev_tunnel_start_happy_path() -> None:
     assert dev_tunnel.start() == "https://abc123-8765.usw2.devtunnels.ms"
     assert dev_tunnel.url == "https://abc123-8765.usw2.devtunnels.ms"
     assert spawned == [["dt", "host", "-p", "8765", "--allow-anonymous"]]
+
+
+def test_dev_tunnel_named_start_ensures_then_hosts_stable_url() -> None:
+    events: list[tuple[str, list[str]]] = []
+    fake_proc = FakeProcess(
+        FakeStdout(["Connect via browser: https://stable-id.devtunnels.ms\n"])
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        events.append(("run", argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        events.append(("popen", argv))
+        return fake_proc
+
+    dev_tunnel = DevTunnel(8765, tunnel_id="stable-id", popen=popen, run=run, timeout=1)
+
+    assert dev_tunnel.start() == "https://stable-id.devtunnels.ms"
+    assert events == [
+        ("run", ["devtunnel", "create", "stable-id", "--allow-anonymous"]),
+        ("run", ["devtunnel", "port", "create", "stable-id", "-p", "8765"]),
+        ("popen", ["devtunnel", "host", "stable-id", "--allow-anonymous"]),
+    ]
 
 
 def test_dev_tunnel_start_raises_when_process_exits_without_url() -> None:
