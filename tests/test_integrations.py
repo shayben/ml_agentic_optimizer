@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+pytest.importorskip("torch")
+
 import torch
 
 from agentic_optimizer.integrations.hf import HFBridgeCallback
