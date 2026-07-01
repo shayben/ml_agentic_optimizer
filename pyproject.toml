@@ -22,6 +22,8 @@ hpo = ["optuna>=3"]
 gpu = ["nvidia-ml-py>=12"]
 torch = ["torch", "torchvision"]
 mlflow = ["mlflow"]
+lightning = ["pytorch-lightning>=2"]
+hf = ["transformers>=4"]
 all = ["agentic-optimizer[broker,mcp,hpo,gpu,mlflow]"]
 dev = [
     "pytest>=7",

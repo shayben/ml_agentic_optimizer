@@ -77,6 +77,7 @@ def run_training(
     run_id: str = "default",
     poll_interval: float = 0.0,
     noise_frac: float = 0.08,
+    checkpoint_dir: str | None = None,
 ) -> TrainingBridge:
     """Train the MLP, bridging the live run to ``client``. Returns the bridge (for inspection)."""
     torch.manual_seed(0)
@@ -86,7 +87,16 @@ def run_training(
 
     model = MLP(classes=classes)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+    # A real LR scheduler so the agent can observe scheduler state (get_scheduler) and reconfigure it
+    # (set_scheduler). step_size is large enough not to fire during the short demo, so it never
+    # clobbers the agent's manual LR changes.
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     state = {"label_smoothing": 0.0}
+
+    def on_scheduler_reconfig(args):
+        step_size = int(args.get("step_size", scheduler.step_size))
+        gamma = float(args.get("gamma", scheduler.gamma))
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
 
     # Per-sample weights: flagging a sample as label noise zeroes its weight, so it stops driving the
     # loss. This is the robustness lever the agent reaches via flag_samples -> on_flagged_samples.
@@ -117,6 +127,13 @@ def run_training(
         poll_interval=poll_interval,
         on_training_config=on_training_config,
         on_flagged_samples=on_flagged_samples,
+        scheduler=scheduler,
+        on_scheduler_reconfig=on_scheduler_reconfig,
+        # Guardrails bound any agent LR change to a safe range (out-of-range requests are clamped).
+        guardrails={"bounds": {"lr": {"min": 1e-5, "max": 0.5}}},
+        # Label noise makes losses spiky; record anomalies but don't auto-pause this scripted demo.
+        auto_pause_on_anomaly=False,
+        checkpoint_dir=checkpoint_dir,
     )
 
     # --- custom influence points the agent can reach ---
@@ -160,22 +177,27 @@ def run_training(
 
     bridge.on_train_begin()
     for epoch in range(epochs):
+        if bridge.should_stop():  # honour a graceful stop_training request from the agent
+            break
         model.train()
         bs = cfg["batch_size"]
         steps_per_epoch = max(1, n // bs)
         perm = torch.randperm(n)
         last_loss = 0.0
         for i in range(steps_per_epoch):
-            idx = perm[i * bs : (i + 1) * bs]
-            xb, yb, wb = x[idx], y[idx], sample_weights[idx]
+            with bridge.section("data"):
+                idx = perm[i * bs : (i + 1) * bs]
+                xb, yb, wb = x[idx], y[idx], sample_weights[idx]
             optimizer.zero_grad()
-            per_sample = F.cross_entropy(
-                model(xb), yb, label_smoothing=state["label_smoothing"], reduction="none"
-            )
-            loss = (per_sample * wb).sum() / wb.sum().clamp(min=1.0)
-            loss.backward()
-            gn = compute_grad_norm(model)
-            bridge.clip_gradients(model)  # honours any agent-set grad_clip
+            with bridge.section("forward"):
+                per_sample = F.cross_entropy(
+                    model(xb), yb, label_smoothing=state["label_smoothing"], reduction="none"
+                )
+                loss = (per_sample * wb).sum() / wb.sum().clamp(min=1.0)
+            with bridge.section("backward"):
+                loss.backward()
+                gn = compute_grad_norm(model)
+                bridge.clip_gradients(model)  # honours any agent-set grad_clip
             optimizer.step()
             last_loss = loss.item()
             # Stream per-sample losses so the agent can triage label noise via get_suspicious_samples.
@@ -187,6 +209,7 @@ def run_training(
                 sample_losses=per_sample.detach().tolist(),
             )
 
+        bridge.scheduler_step()  # advance the LR scheduler (agent can read/reconfigure it)
         val = evaluate({}, None)["val_acc"]
         bridge.on_epoch_end(
             epoch,

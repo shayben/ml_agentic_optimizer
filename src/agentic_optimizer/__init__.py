@@ -6,16 +6,24 @@ The top-level import is intentionally lightweight (no ``torch`` import) so the s
 used in environments without PyTorch. ``AgenticCallback`` is imported lazily on first access.
 """
 from .contract import (
+    AnomalyEvent,
+    CheckpointInfo,
     Command,
     CommandResult,
     CommandStatus,
     ControlSignal,
+    DistributedInfo,
     GpuTelemetry,
+    GuardrailBound,
+    GuardrailConfig,
     Hyperparameters,
     KnobSpec,
     MlflowInfo,
     ParamGroupState,
     PerSampleLoss,
+    ProfileSection,
+    ProfileSummary,
+    SchedulerState,
     Telemetry,
     TrainingConfig,
     TrainingState,
@@ -42,6 +50,14 @@ __all__ = [
     "MlflowInfo",
     "Telemetry",
     "TrainingConfig",
+    "SchedulerState",
+    "ProfileSection",
+    "ProfileSummary",
+    "DistributedInfo",
+    "CheckpointInfo",
+    "AnomalyEvent",
+    "GuardrailBound",
+    "GuardrailConfig",
     "ControlPlaneStore",
     "ControlPlaneClient",
     "create_app",
@@ -51,7 +67,9 @@ __all__ = [
     "DEFAULT_PROMPT",
     "AgenticCallback",
     "TrainingBridge",
+    "NoOpBridge",
     "HandlerRegistry",
+    "attach",
     "OptunaAdvisor",
     "optuna_available",
 ]
@@ -62,7 +80,7 @@ def __getattr__(name: str):  # pragma: no cover - thin lazy import shim
         from .callback import AgenticCallback
 
         return AgenticCallback
-    if name in ("TrainingBridge", "HandlerRegistry"):
+    if name in ("TrainingBridge", "HandlerRegistry", "NoOpBridge", "attach"):
         from . import bridge
 
         return getattr(bridge, name)

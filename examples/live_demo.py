@@ -58,7 +58,7 @@ def _free_port() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=0, help="0 = auto-pick a free port")
-    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--epochs", type=int, default=35)
     ap.add_argument("--token", default=os.environ.get("CONTROL_PLANE_TOKEN"))
     args = ap.parse_args()
     port = args.port or _free_port()
@@ -87,9 +87,14 @@ def main() -> int:
     # local agent drives the live run
     control = ControlPlaneClient.from_url(base_url, args.token)
     obs = agent_sim.run_agent(control, new_lr=0.02)
-    train_thread.join(timeout=45.0)
+    train_thread.join(timeout=60.0)
     control.close()
     bridge = trained.get("bridge")
+
+    guardrail = obs.get("guardrail", {}) or {}
+    guardrail_data = guardrail.get("data") or {}
+    extend = obs.get("extend", {}) or {}
+    extend_data = extend.get("data") or {}
 
     print("\n=== RESULT ===")
     checks = {
@@ -102,6 +107,14 @@ def main() -> int:
         "config_applied": bool(obs.get("set_training_config", {}).get("ready")),
         "flagged_applied": bridge is not None and len(bridge.flagged_indices) > 0,
         "batch_size_applied": bridge is not None and bridge.training_config.batch_size == 256,
+        "profile_seen": bool(obs.get("profile", {}).get("available")),
+        "scheduler_seen": bool(obs.get("scheduler", {}).get("available")),
+        "checkpoint_saved": bool(obs.get("checkpoint", {}).get("ok")),
+        "guardrail_clamped": bool(guardrail.get("ok"))
+        and "guardrails" in guardrail_data
+        and guardrail_data.get("applied", {}).get("lr", 99.0) <= 0.5 + 1e-9,
+        "checkpoint_restored": bool(obs.get("restore", {}).get("ok")),
+        "extended": bool(extend.get("ok")) and extend_data.get("max_epochs") == 999,
     }
     ok = all(checks.values())
     print(f"agent observations: {obs}")

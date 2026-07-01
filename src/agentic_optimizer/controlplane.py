@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -447,6 +448,18 @@ class ControlPlaneClient:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         return cls(TestClient(app, headers=headers))
 
+    @classmethod
+    def from_env(cls, timeout: float = 120.0) -> "ControlPlaneClient | None":
+        """Build a client from ``CONTROL_PLANE_URL`` / ``CONTROL_PLANE_TOKEN``.
+
+        Returns ``None`` when ``CONTROL_PLANE_URL`` is unset, so callers (e.g. :func:`attach`) can
+        run the *same* training script transparently with or without a control plane attached.
+        """
+        url = os.environ.get("CONTROL_PLANE_URL")
+        if not url:
+            return None
+        return cls.from_url(url, token=os.environ.get("CONTROL_PLANE_TOKEN"), timeout=timeout)
+
     def close(self) -> None:
         self._client.close()
 
@@ -550,15 +563,23 @@ class ControlPlaneClient:
 
 def _run_cli() -> None:  # pragma: no cover - thin console entry point
     """``agentic-optimizer-broker`` console script: serve the broker from env config."""
+    import argparse
     import os
 
     import uvicorn
 
     logging.basicConfig(level=logging.INFO)
-    host = os.environ.get("CONTROL_PLANE_HOST", "127.0.0.1")
-    port = int(os.environ.get("CONTROL_PLANE_PORT", "8765"))
+    parser = argparse.ArgumentParser(description="Serve the agentic optimizer control-plane broker.")
+    parser.add_argument("--tunnel", action="store_true", help="Expose the broker with Microsoft Dev Tunnels.")
+    parser.add_argument("--host", default=os.environ.get("CONTROL_PLANE_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("CONTROL_PLANE_PORT", "8765")))
+    parser.add_argument("--devtunnel-cmd", default="devtunnel")
+    args = parser.parse_args()
+
+    host = args.host
+    port = args.port
     token = os.environ.get("CONTROL_PLANE_TOKEN")
-    if not token and os.environ.get("CONTROL_PLANE_INSECURE") != "1":
+    if not args.tunnel and not token and os.environ.get("CONTROL_PLANE_INSECURE") != "1":
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise SystemExit(
                 "Refusing to bind unauthenticated control plane to a non-loopback host. "
@@ -569,5 +590,22 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
     app = create_app(
         ControlPlaneStore(persist_path=persist_path), token=token, max_body_bytes=max_body_bytes
     )
+    if args.tunnel:
+        from .tunnel import serve_with_tunnel
+
+        tunnel_host = "127.0.0.1"
+        logger.info(
+            "control plane on http://%s:%s via Dev Tunnel (auth: %s)",
+            tunnel_host,
+            port,
+            "on" if token else "off",
+        )
+        logger.info(
+            "Use the Dev Tunnel public URL as CONTROL_PLANE_URL on the remote node; "
+            "the bearer token is still required when configured."
+        )
+        serve_with_tunnel(app, tunnel_host, port, cmd=args.devtunnel_cmd)
+        return
+
     logger.info("control plane on http://%s:%s (auth: %s)", host, port, "on" if token else "off")
     uvicorn.run(app, host=host, port=port, log_level="warning")

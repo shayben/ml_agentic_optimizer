@@ -11,12 +11,21 @@ and drive optional HPO.
 **What the agent can do to a live run, without restarting it:**
 
 - **Observe** — step/epoch, loss history, gradient norm, throughput, GPU memory & utilization, pause state,
-  `last_error`, and MLflow run linkage.
-- **Tune the optimizer** — `lr`, `weight_decay`, `momentum`, `grad_clip`.
+  `last_error`, anomalies, scheduler state, a step-time profile, and MLflow run linkage.
+- **Tune the optimizer** — `lr`, `weight_decay`, `momentum`, `grad_clip` (bounded by **guardrails**).
 - **Steer hardware/throughput** — `batch_size`, `num_workers`, `grad_accum_steps`, `amp` (via your callback).
+- **Control the schedule** — read scheduler state and reconfigure the LR scheduler mid-run.
 - **Interrogate** — per-class loss or any custom model/data query you register, mid-run.
 - **Fix data** — pull the highest per-sample losses and flag likely label noise to down-weight or filter.
+- **Train safely** — **checkpoint + rollback** a bad change, **guardrails** clamp unsafe hyperparameters, and
+  **anomaly auto-pause** halts on NaN/Inf/grad-explosion.
+- **Profile** — a built-in step-time breakdown (data-wait vs forward vs backward) for throughput RCA.
+- **Manage the run** — graceful `stop_training` (free the GPU) and `extend_training` (raise `max_epochs`).
 - **Search** — an optional **Optuna** advisor the agent layers root-cause reasoning on top of.
+
+Runs on a raw loop, **PyTorch Lightning**, or **Hugging Face `Trainer`**, and scales to **DDP** (rank-0 telemetry
++ command broadcast). A one-line `attach(optimizer, model)` makes the *same* script run unchanged with or without
+a broker.
 
 ```
  Local dev box                         Reachable control plane                    Remote node (AML/GPU)
@@ -28,16 +37,23 @@ and drive optional HPO.
 ```
 
 Only the **broker** needs a network address. The Copilot CLI and MCP server run on your **local** machine, not on
-the training node. See [`docs/architecture.md`](docs/architecture.md).
+the training node. Or skip the separate broker entirely with the built-in **Dev Tunnel** mode
+(`agentic-optimizer-broker --tunnel`), which publishes a public HTTPS URL for the node to reach. See
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Components
 
 | Module | Role |
 | --- | --- |
-| `agentic_optimizer.controlplane` | FastAPI broker (`agentic-optimizer-broker`), in-memory or SQLite-backed, bearer-token protected. |
-| `agentic_optimizer.bridge` | `TrainingBridge` — remote-side glue in the PyTorch loop. |
+| `agentic_optimizer.controlplane` | FastAPI broker (`agentic-optimizer-broker`), in-memory or SQLite-backed, bearer-token protected; optional Dev Tunnel. |
+| `agentic_optimizer.bridge` | `TrainingBridge` — remote-side glue in the PyTorch loop (+ `attach`/`NoOpBridge` ergonomics). |
 | `agentic_optimizer.mcp_server` | MCP **stdio** server exposing control tools to the local CLI. |
 | `agentic_optimizer.contract` | Shared pydantic models for telemetry, commands, run IDs, and results. |
+| `agentic_optimizer.safety` | Anomaly detection (NaN/Inf/grad-explosion) + hyperparameter guardrails. |
+| `agentic_optimizer.profiling` | `StepProfiler` — per-section step-time breakdown for throughput RCA. |
+| `agentic_optimizer.distributed` | DDP helpers: rank-0 telemetry, command broadcast/barrier. |
+| `agentic_optimizer.integrations` | `LightningBridgeCallback` + `HFBridgeCallback` adapters. |
+| `agentic_optimizer.tunnel` | Dev Tunnel wrapper that publishes the broker over a public HTTPS URL. |
 | `agentic_optimizer.callback` / `driver` | Secondary legacy agent-on-node file-contract mode. |
 
 ## Install matrix
@@ -49,7 +65,8 @@ Base install is intentionally small: `pydantic` + `httpx`.
 | Broker host | `pip install -e ".[broker]"` |
 | Local CLI / MCP side | `pip install -e ".[mcp,hpo]"` |
 | Training node | `pip install -e ".[torch,gpu,mlflow]"` |
-| Optional extras | `[hpo]` = Optuna, `[gpu]` = NVML GPU telemetry (`nvidia-ml-py`), `[mlflow]` = MLflow, `[all]`, `[dev]` |
+| Lightning / HF node | add `".[lightning]"` or `".[hf]"` |
+| Optional extras | `[hpo]` = Optuna, `[gpu]` = NVML GPU telemetry (`nvidia-ml-py`), `[mlflow]` = MLflow, `[lightning]` = PyTorch Lightning adapter, `[hf]` = Hugging Face Trainer adapter, `[all]`, `[dev]` |
 
 The remote node does **not** need FastAPI, uvicorn, MCP, or the Copilot CLI.
 
@@ -60,6 +77,9 @@ Observe and control: `get_training_state`, `get_metrics`, `get_mlflow_info`, `li
 `invoke_and_wait`, `interrogate_and_wait`, `get_suspicious_samples`, `flag_samples`, `run_evaluation`,
 `pause_training`, `resume_training`, and `wait_for_result`.
 
+Safe live control and lifecycle: `save_checkpoint`, `restore_checkpoint`, `list_checkpoints`, `set_guardrails`,
+`get_profile`, `get_scheduler`, `set_scheduler`, `get_anomalies`, `stop_training`, and `extend_training`.
+
 If installed with `[hpo]`, optional advisor tools are also available: `hpo_configure`, `hpo_suggest`,
 `hpo_report`, `hpo_report_intermediate`, and `hpo_best`.
 
@@ -69,6 +89,8 @@ If installed with `[hpo]`, optional advisor tools are also available: `hpo_confi
 # 1) broker (the only reachable component)
 pip install -e ".[broker]"
 CONTROL_PLANE_TOKEN=<strong-token> CONTROL_PLANE_HOST=0.0.0.0 agentic-optimizer-broker
+# …or publish it without hosting a separate endpoint (prints a public HTTPS URL to use below):
+CONTROL_PLANE_TOKEN=<strong-token> agentic-optimizer-broker --tunnel
 
 # 2) remote training job (AML/GPU node), pointed at the broker
 pip install -e ".[torch,gpu,mlflow]"
@@ -110,6 +132,28 @@ python examples/agent_sim.py --broker http://127.0.0.1:8765                     
 
 ## Instrumenting your own loop
 
+The lowest-friction path is `attach(optimizer, model)` plus `bridge.train_step(...)`. `attach` returns a live
+bridge when `CONTROL_PLANE_URL` is set and an inert **`NoOpBridge`** otherwise — so the **same script** runs
+unchanged (and still trains) with or without a broker, becoming agent-steerable only when one is present:
+
+```python
+from agentic_optimizer import attach
+
+bridge = attach(optimizer, model)          # live if CONTROL_PLANE_URL is set, else a no-op stand-in
+with bridge:                               # on_train_begin / on_train_end
+    for epoch in range(epochs):
+        if bridge.should_stop():           # agent can request a graceful stop
+            break
+        for x, y in loader:
+            loss = loss_fn(model(x), y)
+            bridge.train_step(loss, batch_size=len(x))   # backward + grad-clip + step + zero_grad + telemetry
+        bridge.epoch_end(epoch, val_acc=acc)             # push metrics + apply queued agent commands
+```
+
+That is the whole integration — see [`examples/minimal_bridge.py`](examples/minimal_bridge.py). `bridge(loss,
+batch_size=len(x))` is shorthand for `train_step`. For full control, construct the bridge directly and opt into the
+safety, profiling, scheduler, and checkpoint surfaces:
+
 ```python
 from agentic_optimizer.bridge import TrainingBridge
 from agentic_optimizer.controlplane import ControlPlaneClient
@@ -120,29 +164,58 @@ bridge = TrainingBridge(
     optimizer,
     client,
     model=model,
+    scheduler=scheduler,                       # exposed via get_scheduler / set_scheduler
     mlflow=True,
-    poll_interval=1.0,  # optional background poller for prompt command pickup
+    poll_interval=1.0,                         # optional background poller for prompt command pickup
+    auto_pause_on_anomaly=True,                # halt on NaN/Inf/grad-explosion
+    guardrails={"bounds": {"lr": {"min": 1e-5, "max": 0.5}}, "max_rel_change": 10.0},
+    checkpoint_dir="ckpts",                    # enables save_checkpoint / restore_checkpoint rollback
+    on_scheduler_reconfig=lambda args: build_scheduler(optimizer, **args),
     on_training_config=rebuilt_loader_or_amp_callback,
     on_flagged_samples=downweight_or_filter_callback,
 )
 
-bridge.register("per_class_loss", lambda args, ctx: compute_per_class_loss())
+bridge.register("per_class_loss", lambda args, ctx: compute_per_class_loss(), safe_async=True)
 bridge.register_knob("label_smoothing", set_label_smoothing, value=0.0)
 
 bridge.on_train_begin()
 for epoch in range(epochs):
+    if bridge.should_stop():
+        break
     for x, y in loader:
-        ...
-        loss.backward()
+        with bridge.section("data"):           # step-time profiling sections (optional)
+            ...
+        with bridge.section("forward"):
+            loss = loss_fn(model(x), y)
+        with bridge.section("backward"):
+            loss.backward()
         bridge.clip_gradients(model)
         optimizer.step(); optimizer.zero_grad()
         bridge.on_batch_end(loss.item(), batch_size=len(x), grad_norm=compute_grad_norm(model))
+    bridge.scheduler_step()
     bridge.on_epoch_end(epoch, metrics={"val_acc": acc})
 bridge.on_train_end()
 ```
 
-`set_hyperparameters(lr, weight_decay, momentum, grad_clip)` changes optimizer settings. `set_training_config`
-can change `batch_size`, `num_workers`, `grad_accum_steps`, and `amp` through your callback.
+`set_hyperparameters(lr, weight_decay, momentum, grad_clip)` changes optimizer settings (clamped by guardrails).
+`set_training_config` can change `batch_size`, `num_workers`, `grad_accum_steps`, and `amp` through your callback.
+
+### PyTorch Lightning and Hugging Face Trainer
+
+Drop in a callback instead of editing the loop:
+
+```python
+# PyTorch Lightning
+from agentic_optimizer.integrations import LightningBridgeCallback
+trainer = pl.Trainer(callbacks=[LightningBridgeCallback.from_env()], ...)
+
+# Hugging Face Trainer
+from agentic_optimizer.integrations import HFBridgeCallback
+trainer = Trainer(model=model, ..., callbacks=[HFBridgeCallback.from_env()])
+```
+
+Both wrap a `TrainingBridge`/`NoOpBridge` (via `from_env`) and stream telemetry + apply commands at the framework's
+own step/epoch hooks. Install with `".[lightning]"` or `".[hf]"`.
 
 ## Live-control recipes
 
@@ -150,22 +223,27 @@ Patterns the agent (and `agent_sim.py`) follow — inspect first, change one thi
 
 | Symptom | Read | Act | Verify |
 | --- | --- | --- | --- |
-| Loss diverging / grad-norm spikes | `get_training_state` | `set_hyperparameters(lr=…/10, grad_clip=…)` | `get_metrics` |
+| Loss diverging / grad-norm spikes | `get_training_state`, `get_anomalies` | `save_checkpoint` → `set_hyperparameters(lr=…/10, grad_clip=…)` | `get_metrics`; `restore_checkpoint` if worse |
 | Plateau | `get_metrics` | modest LR / regularization change, or start an HPO loop | `get_metrics` |
-| Low GPU util, memory to spare | `gpu.util_pct`, throughput | `set_training_config(batch_size=…, num_workers=…, amp=true)` | throughput in `get_metrics` |
+| Low GPU util, memory to spare | `get_profile`, `gpu.util_pct`, throughput | `set_training_config(batch_size=…, num_workers=…, amp=true)` | `get_profile` / throughput in `get_metrics` |
+| LR fighting the schedule | `get_scheduler` | `set_scheduler({...})` to reshape it mid-run | `get_scheduler`, `get_metrics` |
 | Suspected label noise | `get_suspicious_samples`, `interrogate_and_wait("per_class_loss")` | `flag_samples([...])` → your `on_flagged_samples` down-weights/filters | re-read per-sample losses |
+| Converged early / want more | `get_metrics` | `extend_training(max_epochs=…)` or `stop_training` to free the GPU | `get_training_state` |
 | Need a principled search | — | `hpo_configure` → `hpo_suggest` → apply → `hpo_report` | `hpo_best` |
 
 Mutations apply at the bridge's safe sync points; read-only interrogations registered `safe_async=True` can
-return sooner. Use `wait_for_result(command_id)` to confirm a queued change was applied.
+return sooner. **Guardrails** clamp out-of-range hyperparameters, and **anomaly auto-pause** can halt the run on
+NaN/Inf/grad-explosion. Use `wait_for_result(command_id)` to confirm a queued change was applied.
 
 ## What the agent sees
 
 `get_training_state` returns the latest `Telemetry` for a run: `run_id`, `paused`, `last_error`, advertised
-`knobs`, optional `mlflow` linkage, and a `state` snapshot with `step`/`epoch`/`max_epochs`, recent
-`loss_history`, `metrics`, per-`param_groups` `lr`/`weight_decay`/`momentum`, `grad_norm`,
-`throughput_samples_per_s`, `gpu` (`device`, `mem_used_mb`, `mem_total_mb`, `util_pct`), and `per_sample_losses`
-(highest-loss samples for label-noise triage). All schemas live in `agentic_optimizer.contract`.
+`knobs`, optional `mlflow` linkage, recorded `anomalies` and `checkpoints`, optional `distributed` (rank/world)
+info, and a `state` snapshot with `step`/`epoch`/`max_epochs`, recent `loss_history`, `metrics`,
+per-`param_groups` `lr`/`weight_decay`/`momentum`, `grad_norm`, `throughput_samples_per_s`, `gpu` (`device`,
+`mem_used_mb`, `mem_total_mb`, `util_pct`), `per_sample_losses` (highest-loss samples for label-noise triage), a
+`scheduler` snapshot (`get_scheduler`), and a step-time `profile` (`get_profile`). All schemas live in
+`agentic_optimizer.contract`.
 
 ## Multiple runs on one broker
 
@@ -181,6 +259,9 @@ namespaced by it, so many training jobs can share one broker. The agent calls `l
 - The broker uses constant-time token comparison, request-size limits (`CONTROL_PLANE_MAX_BODY_BYTES`), and refuses
   non-loopback tokenless binding unless `CONTROL_PLANE_INSECURE=1`.
 - Optional SQLite persistence: set `CONTROL_PLANE_PERSIST=<path.db>` on the broker.
+- **No third endpoint, via Dev Tunnel:** run `agentic-optimizer-broker --tunnel` to bind the broker to localhost
+  *and* publish a public HTTPS URL through Microsoft Dev Tunnels (requires the `devtunnel` CLI). The printed URL is
+  what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Always pair with a token.
 
 ## Containers
 
@@ -208,13 +289,18 @@ Architecture and contributor notes: [`docs/architecture.md`](docs/architecture.m
 src/agentic_optimizer/
   contract.py        shared pydantic models (single source of truth)
   controlplane.py    FastAPI broker + httpx ControlPlaneClient
-  bridge.py          TrainingBridge + HandlerRegistry (remote-loop glue)
+  bridge.py          TrainingBridge + HandlerRegistry + attach/NoOpBridge (remote-loop glue)
   mcp_server.py      MCP stdio server: tools + standalone *_impl functions
   telemetry.py       grad-norm + GPU/NVML telemetry helpers
+  safety.py          anomaly detection + hyperparameter guardrails
+  profiling.py       StepProfiler step-time breakdown
+  distributed.py     DDP rank-0 telemetry + command broadcast helpers
+  tunnel.py          Dev Tunnel wrapper for the broker
+  integrations/      Lightning + Hugging Face Trainer callbacks
   optuna_advisor.py  optional Optuna ask/tell advisor
   callback.py        secondary legacy file-contract mode
   driver.py          ↳ agent drivers for that legacy mode
-examples/  run_broker · train_with_bridge · agent_sim · live_demo · cifar10_resnet · aml_job.yml
+examples/  run_broker · minimal_bridge · train_with_bridge · agent_sim · live_demo · cifar10_resnet · aml_job.yml
 docs/ · agent/ · docker/ · auth/
 ```
 
@@ -223,7 +309,8 @@ docs/ · agent/ · docker/ · auth/
 | File | What it is |
 | --- | --- |
 | [`examples/run_broker.py`](examples/run_broker.py) | Start the broker (the only reachable component). |
-| [`examples/train_with_bridge.py`](examples/train_with_bridge.py) | Remote-style PyTorch job wired to the bridge (synthetic data + injected label noise). |
+| [`examples/minimal_bridge.py`](examples/minimal_bridge.py) | Smallest integration: `attach` + `train_step` in a vanilla loop (runs standalone as a no-op). |
+| [`examples/train_with_bridge.py`](examples/train_with_bridge.py) | Remote-style PyTorch job exercising the full surface (scheduler, profiler, guardrails, checkpoints, label noise). |
 | [`examples/agent_sim.py`](examples/agent_sim.py) | Scripted stand-in for the CLI agent; drives the same MCP tool impls. |
 | [`examples/live_demo.py`](examples/live_demo.py) | One command: broker + training + agent, end to end over real HTTP. |
 | [`examples/aml_job.yml`](examples/aml_job.yml) | Azure ML v2 command job that runs the bridge on a GPU node. |

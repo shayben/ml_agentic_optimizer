@@ -13,24 +13,40 @@ The bridge is what makes a run *interactive* for a local agent:
 """
 from __future__ import annotations
 
+import contextlib
+import copy
+import json
 import logging
+import math
+import os
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from . import distributed as dist
 from .contract import (
+    AnomalyEvent as ContractAnomalyEvent,
+    CheckpointInfo,
     Command,
+    DistributedInfo,
+    GuardrailBound,
+    GuardrailConfig,
     KnobSpec,
     MlflowInfo,
     ParamGroupState,
     PerSampleLoss,
+    ProfileSection,
+    ProfileSummary,
+    SchedulerState,
     Telemetry,
     TrainingConfig,
     TrainingState,
 )
 from .controlplane import ControlPlaneClient
-from .telemetry import gpu_telemetry
+from .profiling import StepProfiler
+from .safety import AnomalyDetector, AnomalyEvent, Guardrails
+from .telemetry import compute_grad_norm, gpu_telemetry
 
 Handler = Callable[[dict[str, Any], "HandlerContext"], "dict[str, Any] | None"]
 logger = logging.getLogger("agentic_optimizer.bridge")
@@ -70,6 +86,20 @@ def _opt_float(v: Any) -> float | None:
     return None if v is None else float(v)
 
 
+def _finite_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    """Drop non-finite metric values so telemetry stays JSON-compliant during divergence.
+
+    ``inf``/``nan`` are not JSON-serializable; leaking them makes the whole telemetry
+    push fail (taking anomalies riding the same payload down with it) exactly when the
+    run is diverging and the agent most needs to see it."""
+    out: dict[str, float] = {}
+    for k, v in metrics.items():
+        fv = _as_float(v)
+        if math.isfinite(fv):
+            out[k] = fv
+    return out
+
+
 class TrainingBridge:
     """Bridge a PyTorch training loop to a :class:`ControlPlaneClient`.
 
@@ -107,6 +137,16 @@ class TrainingBridge:
         on_flagged_samples: Callable[[list[int]], None] | None = None,
         poll_interval: float = 0.0,
         max_pause_s: float = 0.0,
+        scheduler: Any = None,
+        scaler: Any = None,
+        on_scheduler_reconfig: Callable[[dict[str, Any]], Any] | None = None,
+        auto_pause_on_anomaly: bool = True,
+        anomaly_detector: AnomalyDetector | None = None,
+        guardrails: GuardrailConfig | dict[str, Any] | None = None,
+        auto_grad_norm: bool = True,
+        profiler: StepProfiler | None = None,
+        checkpoint_dir: str | None = None,
+        max_checkpoints: int = 5,
     ) -> None:
         self.optimizer = optimizer
         self.client = client
@@ -123,6 +163,16 @@ class TrainingBridge:
         self.on_flagged_samples = on_flagged_samples
         self.poll_interval = float(poll_interval)
         self.max_pause_s = float(max_pause_s)
+        self.scheduler = scheduler
+        self.scaler = scaler
+        self.on_scheduler_reconfig = on_scheduler_reconfig
+        self.auto_pause_on_anomaly = bool(auto_pause_on_anomaly)
+        self.auto_grad_norm = bool(auto_grad_norm)
+        self._anomaly = anomaly_detector or AnomalyDetector()
+        self._guardrails = _as_guardrails(guardrails)
+        self.profiler = profiler if profiler is not None else StepProfiler()
+        self._checkpoint_dir = checkpoint_dir
+        self.max_checkpoints = max(0, int(max_checkpoints))
 
         self.registry = HandlerRegistry()
         self._safe: dict[str, bool] = {}
@@ -144,6 +194,10 @@ class TrainingBridge:
         self.training_config = TrainingConfig()
         self.grad_accum_steps = 1
         self.amp_enabled = False
+        self._stop_requested = False
+        self._checkpoints: dict[str, CheckpointInfo] = {}
+        self._ckpt_blobs: dict[str, Any] = {}
+        self._anomalies: list[ContractAnomalyEvent] = []
 
         self._win_t: float | None = None
         self._win_samples = 0
@@ -166,6 +220,12 @@ class TrainingBridge:
         self.registry.register("run_evaluation", self._h_run_evaluation)
         self.registry.register("set_knob", self._h_set_knob)
         self.registry.register("set_training_config", self._h_set_training_config)
+        self.registry.register("save_checkpoint", self._h_save_checkpoint)
+        self.registry.register("restore_checkpoint", self._h_restore_checkpoint)
+        self.registry.register("set_guardrails", self._h_set_guardrails)
+        self.registry.register("set_scheduler", self._h_set_scheduler)
+        self.registry.register("stop_training", self._h_stop_training)
+        self.registry.register("extend_training", self._h_extend_training)
 
     def register(self, name: str, fn: Handler, safe_async: bool = False) -> None:
         """Register an action; ``safe_async`` handlers must be read-only when polled in-thread."""
@@ -182,7 +242,38 @@ class TrainingBridge:
 
     # built-in handler implementations
     def _h_set_hyperparameters(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
-        return {"applied": self.apply_hyperparameters(**_filter_hp_args(args))}
+        hp = _filter_hp_args(args)
+        clamped, notes = self._apply_guardrails(hp)
+        applied = self.apply_hyperparameters(**clamped)
+        result: dict[str, Any] = {"applied": applied}
+        if notes:
+            result["guardrails"] = notes
+        return result
+
+    def _apply_guardrails(
+        self, hp: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Clamp requested hyperparameters to configured bounds/relative-change limits."""
+        current: dict[str, Any] = {"grad_clip": self.grad_clip}
+        if self.optimizer is not None and self.optimizer.param_groups:
+            pg0 = self.optimizer.param_groups[0]
+            current["lr"] = pg0.get("lr")
+            current["weight_decay"] = pg0.get("weight_decay")
+            current["momentum"] = pg0.get("momentum")
+        out = dict(hp)
+        notes: dict[str, Any] = {}
+        for name in ("lr", "weight_decay", "momentum", "grad_clip"):
+            if out.get(name) is None:
+                continue
+            res = self._guardrails.validate(name, float(out[name]), current.get(name))
+            if res.changed:
+                out[name] = res.value
+                notes[name] = {
+                    "requested": float(hp[name]),
+                    "applied": res.value,
+                    "reason": res.reason,
+                }
+        return out, notes
 
     def _h_pause(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
         self.paused = True
@@ -242,6 +333,155 @@ class TrainingBridge:
         if self.on_training_config is not None:
             self.on_training_config(cfg)
         return {"applied": applied}
+
+    def _h_stop_training(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        self._stop_requested = True
+        return {"stopping": True, "epoch": self.epoch, "step": self.step}
+
+    def _h_extend_training(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        if "max_epochs" not in args:
+            raise ValueError("extend_training requires 'max_epochs'")
+        self.max_epochs = int(args["max_epochs"])
+        return {"max_epochs": self.max_epochs}
+
+    def _h_set_guardrails(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        self._guardrails.configure(args)
+        return {"guardrails": self._guardrails.to_dict()}
+
+    def _h_set_scheduler(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        if self.on_scheduler_reconfig is None:
+            raise RuntimeError(
+                "no scheduler reconfigure hook; pass on_scheduler_reconfig=... to TrainingBridge"
+            )
+        new = self.on_scheduler_reconfig(dict(args))
+        if new is not None:
+            self.scheduler = new
+        state = self._scheduler_state()
+        return {"scheduler": state.model_dump() if state is not None else None}
+
+    def _h_save_checkpoint(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        return self.save_checkpoint(
+            checkpoint_id=args.get("id"), note=args.get("note"), metrics=args.get("metrics")
+        )
+
+    def _h_restore_checkpoint(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
+        checkpoint_id = args.get("id")
+        if not checkpoint_id:
+            if not self._checkpoints:
+                raise RuntimeError("no checkpoints have been saved")
+            checkpoint_id = next(reversed(self._checkpoints))  # most recently saved
+        return self.restore_checkpoint(checkpoint_id)
+
+    # ------------------------------------------------------- checkpoint/rollback
+    def save_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+        note: str | None = None,
+        metrics: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Snapshot model/optimizer/scheduler/scaler/RNG so the agent can roll back later."""
+        import uuid
+
+        cid = checkpoint_id or uuid.uuid4().hex[:12]
+        blob: dict[str, Any] = {"step": self.step, "epoch": self.epoch}
+        for name, obj in (
+            ("model", self.model),
+            ("optimizer", self.optimizer),
+            ("scheduler", self.scheduler),
+            ("scaler", self.scaler),
+        ):
+            if obj is not None and hasattr(obj, "state_dict"):
+                blob[name] = obj.state_dict()
+        blob["rng"] = _capture_rng()
+        path: str | None = None
+        if self._checkpoint_dir:
+            try:
+                import torch
+
+                os.makedirs(self._checkpoint_dir, exist_ok=True)
+                path = os.path.join(self._checkpoint_dir, f"{cid}.pt")
+                torch.save(blob, path)
+            except Exception:
+                path = None
+                self._ckpt_blobs[cid] = _clone_state(blob)
+        else:
+            self._ckpt_blobs[cid] = _clone_state(blob)
+        info = CheckpointInfo(
+            id=cid,
+            step=self.step,
+            epoch=self.epoch,
+            metrics={k: float(v) for k, v in (metrics or {}).items()},
+            path=path,
+            note=note,
+        )
+        self._checkpoints[cid] = info
+        self._evict_checkpoints()
+        return {"id": cid, "step": self.step, "epoch": self.epoch, "path": path}
+
+    def restore_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
+        """Roll the live run back to a saved checkpoint (weights/optimizer/scheduler/RNG)."""
+        blob = self._load_blob(checkpoint_id)
+        if blob is None:
+            raise RuntimeError(f"unknown checkpoint {checkpoint_id!r}")
+        for name, obj in (
+            ("model", self.model),
+            ("optimizer", self.optimizer),
+            ("scheduler", self.scheduler),
+            ("scaler", self.scaler),
+        ):
+            if obj is not None and name in blob and hasattr(obj, "load_state_dict"):
+                obj.load_state_dict(blob[name])
+        _restore_rng(blob.get("rng"))
+        self.step = int(blob.get("step", self.step))
+        self.epoch = int(blob.get("epoch", self.epoch))
+        self._anomaly.reset()
+        return {"restored": checkpoint_id, "step": self.step, "epoch": self.epoch}
+
+    def _load_blob(self, checkpoint_id: str) -> dict[str, Any] | None:
+        if checkpoint_id in self._ckpt_blobs:
+            return self._ckpt_blobs[checkpoint_id]
+        info = self._checkpoints.get(checkpoint_id)
+        if info is not None and info.path:
+            import torch
+
+            return torch.load(info.path, map_location="cpu", weights_only=False)
+        return None
+
+    def _evict_checkpoints(self) -> None:
+        if self.max_checkpoints <= 0:
+            return
+        while len(self._checkpoints) > self.max_checkpoints:
+            oldest_id = next(iter(self._checkpoints))  # least recently saved
+            oldest = self._checkpoints.pop(oldest_id, None)
+            self._ckpt_blobs.pop(oldest_id, None)
+            if oldest is not None and oldest.path:
+                with contextlib.suppress(OSError):
+                    os.remove(oldest.path)
+
+    # ------------------------------------------------------------- scheduler
+    def scheduler_step(self, *args: Any, **kwargs: Any) -> None:
+        """Step the attached LR scheduler (call where you'd normally call ``scheduler.step()``)."""
+        if self.scheduler is not None and hasattr(self.scheduler, "step"):
+            self.scheduler.step(*args, **kwargs)
+
+    def _scheduler_state(self) -> SchedulerState | None:
+        scheduler = self.scheduler
+        if scheduler is None:
+            return None
+        last_lr: list[float] = []
+        try:
+            if hasattr(scheduler, "get_last_lr"):
+                last_lr = [float(x) for x in scheduler.get_last_lr()]
+            elif self.optimizer is not None:
+                last_lr = [float(pg.get("lr", 0.0)) for pg in self.optimizer.param_groups]
+        except Exception:
+            last_lr = []
+        return SchedulerState(
+            name=type(scheduler).__name__,
+            last_lr=last_lr,
+            last_epoch=getattr(scheduler, "last_epoch", None),
+            config=_scheduler_config(scheduler),
+        )
 
     # ------------------------------------------------------------- mutation
     def apply_hyperparameters(
@@ -307,15 +547,21 @@ class TrainingBridge:
     ) -> None:
         self.step += 1
         self._win_samples += int(batch_size)
-        try:
-            self.loss_history.append(float(loss))
-        except (TypeError, ValueError):
-            pass
-        if len(self.loss_history) > self.history_len:
-            self.loss_history = self.loss_history[-self.history_len :]
+        loss_val = _as_float(loss)
+        if math.isfinite(loss_val):
+            self.loss_history.append(loss_val)
+            if len(self.loss_history) > self.history_len:
+                self.loss_history = self.loss_history[-self.history_len :]
+        if grad_norm is None and self.auto_grad_norm and self.model is not None:
+            grad_norm = self._auto_grad_norm()
         if grad_norm is not None:
-            self.grad_norm = float(grad_norm)
+            gn = float(grad_norm)
+            self.grad_norm = gn if math.isfinite(gn) else None
         self._track_suspicious_losses(sample_indices, sample_losses)
+        event = self._anomaly.update(loss=loss_val, grad_norm=grad_norm, step=self.step)
+        if event is not None:
+            self._record_anomaly(event)
+        self.profiler.mark_step()
         if self.apply_every_batches and (self.step % self.apply_every_batches == 0):
             self.push_telemetry({})
             self.drain_commands()
@@ -324,10 +570,13 @@ class TrainingBridge:
         self.epoch = epoch
         self.push_telemetry(metrics or {})
         processed = self.drain_commands()
-        # Honour a live pause: keep serving commands until the agent resumes.
+        # Honour a live pause: keep serving commands until the agent resumes. The pause
+        # decision is synchronized across ranks each iteration (see _sync_paused) so every
+        # rank issues the same collectives and the process group never deadlocks on a
+        # one-sided pause; rank 0 owns the broker connection and max_pause_s auto-resume.
         pause_started = time.monotonic()
         broker_errors = 0
-        while self.paused:
+        while self._sync_paused():
             before_error_serial = self._error_serial
             self.push_telemetry({})
             processed += self.drain_commands()
@@ -337,13 +586,33 @@ class TrainingBridge:
                     logger.error("broker errors during pause; waiting for resume may be blocked")
             else:
                 broker_errors = 0
-            if self.max_pause_s > 0 and time.monotonic() - pause_started > self.max_pause_s:
+            # Only rank 0 (or a single process) decides the auto-resume timeout; clearing
+            # self.paused here is propagated to every rank by the next _sync_paused() so
+            # they all leave the loop together rather than one rank breaking early.
+            if (
+                (not dist.is_available() or dist.is_main_process())
+                and self.max_pause_s > 0
+                and time.monotonic() - pause_started > self.max_pause_s
+            ):
                 logger.warning("auto-resume after max_pause_s=%s", self.max_pause_s)
                 self.paused = False
-                break
             if self.paused:
                 time.sleep(self.pause_poll_s)
         return processed
+
+    def _sync_paused(self) -> bool:
+        """Resolve one pause decision shared by every rank for this loop iteration.
+
+        ``pause``/``resume`` are non-replicated (rank-0-only) commands, so in distributed
+        mode the other ranks never see them directly. Rank 0 owns the pause state (broker
+        connection + ``max_pause_s`` auto-resume) and broadcasts it here; every rank loops
+        the same number of times and issues matched collective calls. Without this a
+        one-sided pause desyncs the ranks and deadlocks the process group on the next
+        broadcast. In single-process mode this is just ``self.paused``."""
+        if not dist.is_available():
+            return self.paused
+        self.paused = bool(dist.broadcast_object(bool(self.paused), src=0))
+        return self.paused
 
     def on_train_end(self) -> None:
         if self._poll_thread is not None:
@@ -375,21 +644,29 @@ class TrainingBridge:
                 self._susp.items(), key=lambda item: item[1], reverse=True
             )
         ]
+        gpu = gpu_telemetry()
+        dinfo = dist.info()
         return TrainingState(
             step=self.step,
             epoch=self.epoch,
             max_epochs=self.max_epochs,
             timestamp=now,
-            metrics={k: float(v) for k, v in metrics.items()},
+            metrics=_finite_metrics(metrics),
             loss_history=list(self.loss_history),
             param_groups=param_groups,
             grad_norm=self.grad_norm,
             throughput_samples_per_s=throughput,
-            gpu=gpu_telemetry(),
+            gpu=gpu,
             per_sample_losses=per_sample_losses,
+            scheduler=self._scheduler_state(),
+            profile=self._profile_summary(gpu),
+            distributed=DistributedInfo(**dinfo) if dinfo.get("enabled") else None,
+            stop_requested=self._stop_requested,
         )
 
     def push_telemetry(self, metrics: dict[str, float]) -> None:
+        if dist.is_available() and not dist.is_main_process():
+            return
         state = self.build_state(metrics)
         telem = Telemetry(
             run_id=self.run_id,
@@ -398,6 +675,10 @@ class TrainingBridge:
             paused=self.paused,
             knobs=list(self.knobs.values()),
             last_error=self.last_error,
+            checkpoints=list(self._checkpoints.values()),
+            anomalies=list(self._anomalies),
+            guardrails=self._guardrails_config(),
+            stopping=self._stop_requested,
         )
         try:
             self.client.push_telemetry(telem)
@@ -408,6 +689,10 @@ class TrainingBridge:
             logger.warning("failed to push telemetry", exc_info=True)
 
     def drain_commands(self, max_commands: int = 100) -> list[Command]:
+        # In distributed mode, only rank 0 talks to the broker; mutations are then
+        # broadcast to the other ranks so every replica applies the same change.
+        if dist.is_available() and not dist.is_main_process():
+            return self._apply_replicated_commands()
         processed: list[Command] = []
         if self._poll_thread is not None or self._deferred:
             with self._dlock:
@@ -429,6 +714,7 @@ class TrainingBridge:
             self._execute(cmd)
             processed.append(cmd)
             self.processed_commands.append(cmd)
+        self._broadcast_processed(processed)
         return processed
 
     def _resolve(self, cmd: Command) -> tuple[Handler, dict[str, Any]]:
@@ -473,6 +759,8 @@ class TrainingBridge:
         for index, loss in zip(sample_indices, sample_losses, strict=False):
             i = int(index)
             sample_loss = float(loss)
+            if not math.isfinite(sample_loss):
+                continue
             if i not in self._susp or sample_loss > self._susp[i]:
                 self._susp[i] = sample_loss
         if len(self._susp) > self.susp_topk:
@@ -483,7 +771,14 @@ class TrainingBridge:
             )
 
     def _is_safe_async(self, cmd: Command) -> bool:
-        if cmd.type in {"pause", "resume", "flag_samples"}:
+        if cmd.type in {
+            "pause",
+            "resume",
+            "flag_samples",
+            "stop_training",
+            "extend_training",
+            "set_guardrails",
+        }:
             return True
         if cmd.type in {"invoke", "interrogate"}:
             name = cmd.args.get("action") or cmd.args.get("name")
@@ -515,6 +810,164 @@ class TrainingBridge:
                 logger.warning("command poller iteration failed", exc_info=True)
                 self._poll_stop.wait(min(self.poll_interval * 2, 5.0))
 
+    # ----------------------------------------------------------- ergonomics
+    def train_step(
+        self,
+        loss: Any,
+        optimizer: Any = None,
+        *,
+        backward: bool = True,
+        batch_size: int = 0,
+        grad_norm: float | None = None,
+        sample_indices: Any = None,
+        sample_losses: Any = None,
+        zero_grad: bool = True,
+    ) -> None:
+        """One-call training step: backward → clip → opt.step → zero_grad → on_batch_end.
+
+        ``loss`` may be a tensor (``backward=True`` calls ``loss.backward()``) or a float.
+        Grad-norm is captured *before* ``zero_grad`` so anomaly detection sees real gradients.
+        The bridge is also callable, so ``bridge(loss, batch_size=n)`` is shorthand for this.
+        """
+        opt = optimizer or self.optimizer
+        loss_val = _as_float(loss)
+        if backward and hasattr(loss, "backward"):
+            loss.backward()
+        captured = grad_norm
+        if captured is None and self.grad_clip is not None:
+            captured = self.clip_gradients()
+        if captured is None and self.auto_grad_norm and self.model is not None:
+            captured = self._auto_grad_norm()
+        if opt is not None and hasattr(opt, "step"):
+            opt.step()
+        if zero_grad and opt is not None and hasattr(opt, "zero_grad"):
+            opt.zero_grad()
+        self.on_batch_end(
+            loss_val,
+            batch_size=batch_size,
+            grad_norm=captured,
+            sample_indices=sample_indices,
+            sample_losses=sample_losses,
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        """Shorthand for :meth:`train_step` so ``bridge(loss, batch_size=n)`` just works."""
+        return self.train_step(*args, **kwargs)
+
+    def epoch_end(self, epoch: int | None = None, **metrics: float) -> list[Command]:
+        """Convenience wrapper around :meth:`on_epoch_end` (auto-increments epoch)."""
+        ep = epoch if epoch is not None else self.epoch + 1
+        return self.on_epoch_end(ep, {k: float(v) for k, v in metrics.items()})
+
+    def should_stop(self) -> bool:
+        """True once the agent has requested a graceful stop (poll this in your loop)."""
+        return self._stop_requested
+
+    def section(self, name: str) -> Any:
+        """Profiler timing section context manager (e.g. ``with bridge.section("forward"):``)."""
+        return self.profiler.section(name)
+
+    def __enter__(self) -> TrainingBridge:
+        self.on_train_begin()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.on_train_end()
+
+    @classmethod
+    def from_env(
+        cls, optimizer: Any = None, model: Any = None, **kwargs: Any
+    ) -> TrainingBridge | NoOpBridge:
+        """Build a bridge from ``CONTROL_PLANE_*`` env vars.
+
+        Returns a :class:`NoOpBridge` when ``CONTROL_PLANE_URL`` is unset so the *same*
+        training script runs unchanged with or without the control plane configured.
+        """
+        client = ControlPlaneClient.from_env()
+        if client is None:
+            return NoOpBridge(optimizer, model, **kwargs)
+        run_id = kwargs.pop("run_id", None) or os.environ.get("CONTROL_PLANE_RUN_ID") or "default"
+        return cls(optimizer, client, model=model, run_id=run_id, **kwargs)
+
+    # --------------------------------------------------- anomaly / profiler
+    def _auto_grad_norm(self) -> float | None:
+        if self.model is None:
+            return None
+        try:
+            return compute_grad_norm(self.model.parameters())
+        except Exception:
+            return None
+
+    def _record_anomaly(self, event: AnomalyEvent) -> None:
+        value = event.value if event.value is not None and math.isfinite(event.value) else None
+        contract_event = ContractAnomalyEvent(
+            kind=event.kind,
+            message=event.message,
+            value=value,
+            step=event.step if event.step is not None else self.step,
+        )
+        self._anomalies.append(contract_event)
+        if len(self._anomalies) > 50:
+            self._anomalies = self._anomalies[-50:]
+        self.last_error = f"anomaly: {event.message}"
+        self._error_serial += 1
+        logger.warning("training anomaly detected: %s", event.message)
+        if self.auto_pause_on_anomaly:
+            self.paused = True
+
+    def _profile_summary(self, gpu: Any) -> ProfileSummary | None:
+        summary = self.profiler.summary()
+        if not summary.get("steps"):
+            return None
+        gpu_util = getattr(gpu, "util_pct", None) if gpu is not None else None
+        sections = [
+            ProfileSection(name=s["name"], ms_avg=s["ms_avg"], pct=s["pct"])
+            for s in summary.get("sections", [])
+        ]
+        return ProfileSummary(
+            steps=summary["steps"],
+            step_ms_avg=summary["step_ms_avg"],
+            sections=sections,
+            suggestions=self.profiler.suggest(gpu_util_pct=gpu_util),
+        )
+
+    def _guardrails_config(self) -> GuardrailConfig | None:
+        cfg = self._guardrails.to_dict()
+        if not cfg.get("bounds") and cfg.get("max_rel_change") is None:
+            return None
+        bounds = {
+            name: GuardrailBound(min=b.get("min"), max=b.get("max"))
+            for name, b in cfg.get("bounds", {}).items()
+        }
+        return GuardrailConfig(bounds=bounds, max_rel_change=cfg.get("max_rel_change"))
+
+    # ------------------------------------------------------- distributed io
+    def _broadcast_processed(self, processed: list[Command]) -> None:
+        if not dist.is_available():
+            return
+        payload = [
+            {"type": c.type, "args": c.args}
+            for c in processed
+            if c.type not in _NON_REPLICATED
+        ]
+        dist.broadcast_object(payload, src=0)
+
+    def _apply_replicated_commands(self) -> list[Command]:
+        payload = dist.broadcast_object(None, src=0)
+        applied: list[Command] = []
+        for item in payload or []:
+            cmd = Command(type=item["type"], args=item.get("args", {}))
+            try:
+                handler, hargs = self._resolve(cmd)
+                ctx = HandlerContext(
+                    bridge=self, optimizer=self.optimizer, model=self.model, args=hargs, command=cmd
+                )
+                handler(hargs, ctx)
+                applied.append(cmd)
+            except Exception:
+                logger.warning("replica failed to apply %s", cmd.type, exc_info=True)
+        return applied
+
     # --------------------------------------------------------------- mlflow
     def _mlflow_info(self, metrics: dict[str, float]) -> MlflowInfo | None:
         if self._mlflow_info_provider is not None:
@@ -539,14 +992,262 @@ def _default_mlflow_info(bridge: TrainingBridge, metrics: dict[str, float]) -> M
         if run is None:
             return None
         if metrics:
-            mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=bridge.step)
+            mlflow.log_metrics(_finite_metrics(metrics), step=bridge.step)
         info = run.info
         return MlflowInfo(
             run_id=info.run_id,
             tracking_uri=mlflow.get_tracking_uri(),
             experiment=getattr(info, "experiment_id", None),
             run_name=getattr(info, "run_name", None),
-            metrics={k: float(v) for k, v in metrics.items()},
+            metrics=_finite_metrics(metrics),
         )
     except Exception:
         return None
+
+
+# Commands that must NOT be replayed on non-zero ranks (rank-0-only side effects).
+_NON_REPLICATED = {
+    "interrogate",
+    "invoke",
+    "run_evaluation",
+    "flag_samples",
+    "save_checkpoint",
+    "pause",
+    "resume",
+    "stop_training",
+    "extend_training",
+}
+
+
+def _as_guardrails(g: Guardrails | GuardrailConfig | dict[str, Any] | None) -> Guardrails:
+    """Coerce assorted guardrail inputs into a :class:`Guardrails` instance."""
+    if isinstance(g, Guardrails):
+        return g
+    if g is None:
+        return Guardrails()
+    if isinstance(g, GuardrailConfig):
+        return Guardrails(g.model_dump())
+    return Guardrails(dict(g))
+
+
+def _as_float(v: Any) -> float:
+    """Best-effort float conversion (tensor ``.item()`` aware); NaN on failure."""
+    if v is None:
+        return math.nan
+    item = getattr(v, "item", None)
+    if callable(item):
+        with contextlib.suppress(Exception):
+            return float(item())
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _clone_state(value: Any) -> Any:
+    """Deep-copy a (possibly nested) ``state_dict`` so an in-memory checkpoint does not
+    alias live tensors.
+
+    Real ``torch`` ``state_dict()`` tensors share storage with live parameters; the next
+    ``optimizer.step()`` mutates that storage in place, so an un-cloned snapshot silently
+    drifts and ``restore_checkpoint`` becomes a no-op. Tensors are detached, moved to CPU,
+    and cloned; dict/list/tuple containers recurse; anything else is deep-copied."""
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {k: _clone_state(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_state(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_state(v) for v in value)
+    with contextlib.suppress(Exception):
+        return copy.deepcopy(value)
+    return value
+
+
+def _capture_rng() -> dict[str, Any]:
+    """Snapshot Python/torch/CUDA RNG state for reproducible checkpoint restore."""
+    import random
+
+    state: dict[str, Any] = {"python": random.getstate()}
+    try:
+        import torch
+
+        state["torch"] = torch.get_rng_state()
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+    except Exception:
+        pass
+    return state
+
+
+def _restore_rng(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    import random
+
+    with contextlib.suppress(Exception):
+        random.setstate(state["python"])
+    try:
+        import torch
+
+        if "torch" in state:
+            torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda"])
+    except Exception:
+        pass
+
+
+def _scheduler_config(scheduler: Any) -> dict[str, Any]:
+    """Extract JSON-serialisable scheduler attributes for telemetry."""
+    keys = (
+        "base_lrs",
+        "gamma",
+        "step_size",
+        "T_max",
+        "eta_min",
+        "factor",
+        "patience",
+        "milestones",
+        "total_steps",
+        "max_lr",
+        "min_lr",
+    )
+    cfg: dict[str, Any] = {}
+    for key in keys:
+        if not hasattr(scheduler, key):
+            continue
+        val = getattr(scheduler, key)
+        if not _json_safe(val):
+            with contextlib.suppress(TypeError, ValueError):
+                val = list(val)
+        if _json_safe(val):
+            cfg[key] = val
+    return cfg
+
+
+def _json_safe(val: Any) -> bool:
+    try:
+        json.dumps(val)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+class NoOpBridge:
+    """A control-plane-free stand-in returned by :func:`attach` when no broker is configured.
+
+    Training still runs normally: :meth:`train_step` / :meth:`__call__` perform the real
+    ``loss.backward()`` → grad-clip → ``optimizer.step()`` → ``zero_grad()``, and
+    :meth:`scheduler_step` advances the scheduler. Only the *control-plane* surface (telemetry
+    push, command draining, checkpoints, interrogations) is inert. This way the *same* training
+    script runs unchanged — and actually trains — whether or not ``CONTROL_PLANE_URL`` is set,
+    becoming agent-steerable only when a broker is present. ``should_stop()`` is always ``False``
+    and :meth:`section` yields a null context.
+    """
+
+    paused = False
+
+    def __init__(
+        self,
+        optimizer: Any = None,
+        model: Any = None,
+        *,
+        scheduler: Any = None,
+        grad_clip: float | None = None,
+        **_: Any,
+    ) -> None:
+        self.optimizer = optimizer
+        self.model = model
+        self.scheduler = scheduler
+        self.grad_clip = grad_clip
+
+    def __enter__(self) -> NoOpBridge:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def should_stop(self) -> bool:
+        return False
+
+    def section(self, name: str) -> Any:
+        return contextlib.nullcontext()
+
+    def train_step(
+        self,
+        loss: Any = None,
+        optimizer: Any = None,
+        *,
+        backward: bool = True,
+        zero_grad: bool = True,
+        **_: Any,
+    ) -> None:
+        """Drive the real optimization step (telemetry is dropped, training is not)."""
+        opt = optimizer or self.optimizer
+        if backward and hasattr(loss, "backward"):
+            loss.backward()
+        self.clip_gradients()
+        if opt is not None and hasattr(opt, "step"):
+            opt.step()
+        if zero_grad and opt is not None and hasattr(opt, "zero_grad"):
+            opt.zero_grad()
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        return self.train_step(*args, **kwargs)
+
+    def clip_gradients(self, model: Any = None) -> float | None:
+        target = model or self.model
+        if self.grad_clip is None or target is None or not hasattr(target, "parameters"):
+            return None
+        try:
+            import torch
+
+            return float(
+                torch.nn.utils.clip_grad_norm_(target.parameters(), float(self.grad_clip))
+            )
+        except Exception:
+            return None
+
+    def scheduler_step(self, *args: Any, **kwargs: Any) -> None:
+        if self.scheduler is not None and hasattr(self.scheduler, "step"):
+            self.scheduler.step(*args, **kwargs)
+
+    def register(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def register_knob(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Callable[..., None]:
+        def _noop(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        return _noop
+
+
+def attach(
+    optimizer: Any = None, model: Any = None, **kwargs: Any
+) -> TrainingBridge | NoOpBridge:
+    """One-call entry point: build a bridge from the environment.
+
+    Equivalent to :meth:`TrainingBridge.from_env`. Returns a :class:`NoOpBridge` when
+    ``CONTROL_PLANE_URL`` is unset, so you can sprinkle ``bridge = attach(optimizer, model)``
+    into any script and it stays inert until a control plane is configured::
+
+        with attach(optimizer, model) as bridge:
+            for epoch in range(epochs):
+                for x, y in loader:
+                    loss = loss_fn(model(x), y)
+                    bridge.train_step(loss, batch_size=len(x))  # or: bridge(loss, batch_size=len(x))
+                bridge.epoch_end(epoch, val_acc=acc)
+                if bridge.should_stop():
+                    break
+    """
+    return TrainingBridge.from_env(optimizer, model=model, **kwargs)

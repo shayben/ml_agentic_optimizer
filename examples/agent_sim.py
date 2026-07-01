@@ -95,7 +95,34 @@ def run_agent(client: ControlPlaneClient, new_lr: float = 0.02, verbose: bool = 
     # 8) one-call convenience: invoke a custom action and wait for its result
     obs["evaluation2"] = tools.invoke_and_wait_impl(client, "evaluate", timeout=10.0)
 
-    # 9) optional principled HPO loop (only runs if the optuna extra is installed)
+    # 9) safe-live-control surfaces: profiler RCA, scheduler awareness, checkpoint + rollback,
+    #    guardrail clamp, and run-lifecycle extension.
+    obs["profile"] = tools.get_profile_impl(client)
+    obs["scheduler"] = tools.get_scheduler_impl(client)
+
+    ckpt = tools.save_checkpoint_impl(client, note="pre-clamp", timeout=10.0)
+    obs["checkpoint"] = ckpt
+    if verbose:
+        print(f"[agent] saved checkpoint -> {ckpt}")
+
+    # request an out-of-range LR; guardrails should clamp it to the configured max
+    clamp = tools.set_hyperparameters_impl(client, lr=10.0)
+    obs["guardrail"] = tools.wait_for_result_impl(client, clamp["command_id"], timeout=10.0)
+    if verbose:
+        print(f"[agent] guardrail-clamped lr=10.0 -> {obs['guardrail']}")
+
+    # roll back to the checkpoint we just saved
+    cid = (ckpt.get("data") or {}).get("id") if ckpt.get("ready") else None
+    if cid:
+        obs["restore"] = tools.restore_checkpoint_impl(client, cid, timeout=10.0)
+    obs["checkpoints"] = tools.list_checkpoints_impl(client)
+
+    # extend the training budget (the agent decided the run is promising)
+    ext = tools.extend_training_impl(client, max_epochs=999)
+    obs["extend"] = tools.wait_for_result_impl(client, ext["command_id"], timeout=10.0)
+    obs["anomalies"] = tools.get_anomalies_impl(client)
+
+    # 10) optional principled HPO loop (only runs if the optuna extra is installed)
     obs["hpo"] = _run_hpo(client, verbose=verbose)
     return obs
 

@@ -2,7 +2,9 @@
 
 A local **GitHub Copilot CLI** session drives one or more **remote PyTorch training runs** through a local
 **MCP stdio server** and a reachable **HTTP broker**, to stream telemetry/MLflow and interject mid-run
-(hyperparameters, throughput/hardware, interrogations, label-noise handling, optional HPO).
+(hyperparameters, throughput/hardware, interrogations, label-noise handling, checkpoint/rollback, guardrails,
+profiler RCA, scheduler control, run lifecycle, DDP, optional HPO). It runs on a raw loop, **Lightning**, or
+**HF `Trainer`**, and `attach(optimizer, model)` makes the *same* script run unchanged with or without a broker.
 
 > This file is about working *on* this repository. `agent/AGENTS.md` is a different audience: it is the
 > runtime playbook for the agent *operating a live run* via the MCP tools. Don't conflate the two.
@@ -15,12 +17,14 @@ Windows + PowerShell dev box; Python ≥ 3.10 (CI runs 3.10 and 3.12).
 pip install -e ".[dev]"                 # dev tooling — NOTE: intentionally has NO torch
 python -m pytest -q                      # full suite (keep it green)
 python -m pytest tests/test_integration.py::test_run_id_isolation   # single test
-python -m pytest tests/test_bridge.py -q                            # single file
+python -m pytest tests/test_bridge_control.py -q                    # single file (live-control suite)
 python -m ruff check .                   # lint (line-length 100, target py310)
+python examples/minimal_bridge.py        # zero-config smoke (runs as NoOpBridge, no broker needed)
 python examples/live_demo.py             # end-to-end smoke over real HTTP; exits 0 on success
 ```
 
-CI (`.github/workflows/ci.yml`) installs `[dev]` then runs `ruff check .` and `pytest -q`.
+CI (`.github/workflows/ci.yml`) installs `[dev]` then runs `ruff check .` and `pytest -q`. `[dev]` deliberately
+omits `torch`, `pytorch-lightning`, and `transformers`, so torch/Lightning tests self-skip in CI.
 
 ## Architecture (three processes, one broker)
 
@@ -39,6 +43,12 @@ queue → bridge claims with a lease (background poller or sync point) → runs 
 `wait_for_result`. `callback.py`/`driver.py` are a **secondary** legacy file-contract mode (`state.json`/
 `control.json`); the MCP path is primary.
 
+The bridge composes four newer, file-disjoint helper modules: `safety.py` (anomaly detection + guardrails),
+`profiling.py` (`StepProfiler` step-time breakdown), `distributed.py` (DDP rank/broadcast helpers), and
+`tunnel.py` (publishes the broker over Dev Tunnels via `agentic-optimizer-broker --tunnel`). `integrations/`
+adapts the bridge to Lightning/HF as callbacks. `attach()` / `NoOpBridge` (in `bridge.py`) are the low-friction
+entry point — see the conventions below.
+
 ## Project-specific conventions (the non-obvious ones)
 
 - **Keep the training node lightweight.** It must run on only `pydantic`, `httpx`, `torch`. `controlplane.py`
@@ -49,17 +59,45 @@ queue → bridge claims with a lease (background poller or sync point) → runs 
   `pytest.importorskip("torch")` (see `tests/test_telemetry.py`). `telemetry.gpu_telemetry()` returns `None`
   (never raises) when torch/NVML are absent.
 - **Dependencies are role-based extras**, not one blob: `[broker]`, `[mcp]`, `[hpo]` (Optuna), `[gpu]`
-  (`nvidia-ml-py`, imported as the `pynvml` module), `[torch]`, `[mlflow]`, `[all]`, `[dev]`. Put new deps in the
-  narrowest extra that needs them.
+  (`nvidia-ml-py`, imported as the `pynvml` module), `[torch]`, `[mlflow]`, `[lightning]`, `[hf]`, `[all]`, `[dev]`.
+  Put new deps in the narrowest extra that needs them. `[all]` and `[dev]` deliberately exclude the heavy
+  `torch`/`lightning`/`hf` sets.
 - **MCP tools come in pairs.** Each tool is a standalone `*_impl(client, ...)` function (unit-testable in-process)
   wrapped by a thin `@mcp.tool()` in `build_server`. Impls are decorated with `_safe_impl`, so they return
   `{"error": ..., "available": False}` instead of raising. Tests and `examples/agent_sim.py` drive the `*_impl`
   functions directly — add new tools the same way.
-- **Bridge command safety classes.** `_is_safe_async` decides execution: `pause`/`resume`/`flag_samples` and any
-  interrogation/action registered via `bridge.register(name, fn, safe_async=True)` run **immediately** in the
-  background poller thread and **must be read-only**; everything that mutates the loop (`set_hyperparameters`,
-  `set_training_config`, `set_knob`, `set_augmentation`, `run_evaluation`) is **deferred** to a training-thread
-  sync point (`drain_commands` at `on_epoch_end`). `_poll_once()` is split out for deterministic testing.
+- **Bridge command safety classes.** `_is_safe_async` decides execution: `pause`/`resume`/`flag_samples`/
+  `stop_training`/`extend_training`/`set_guardrails` and any interrogation/action registered via
+  `bridge.register(name, fn, safe_async=True)` run **immediately** in the background poller thread and **must be
+  read-only / non-torch-mutating**; everything that mutates the loop or torch state (`set_hyperparameters`,
+  `set_training_config`, `set_knob`, `set_augmentation`, `set_scheduler`, `save_checkpoint`, `restore_checkpoint`,
+  `run_evaluation`) is **deferred** to a training-thread sync point (`drain_commands` at `on_epoch_end`). When you
+  add a command, classify it here; anything touching tensors/optimizer/model must be deferred. `_poll_once()` is
+  split out for deterministic testing.
+- **`attach()` returns a `NoOpBridge` off the control plane — and it must still TRAIN.** `attach(optimizer, model)`
+  (== `TrainingBridge.from_env`) returns a live bridge when `CONTROL_PLANE_URL` is set and a `NoOpBridge`
+  otherwise, so the *same* script runs unchanged. `NoOpBridge` is **not fully inert**: `train_step`/`__call__`
+  still run `backward`→clip→`optimizer.step()`→`zero_grad()` and `scheduler_step` still steps the scheduler — only
+  the control-plane I/O (telemetry/commands/checkpoints) is a no-op. If you add loop-driving behavior to
+  `TrainingBridge.train_step`/`scheduler_step`, mirror it in `NoOpBridge` or models silently stop training
+  off-plane.
+- **`bridge.step` is an int, not a method.** `self.step` is the step counter (read in telemetry/MLflow). The
+  one-call ergonomic step is `bridge.train_step(loss, batch_size=n)` (or `bridge(loss, batch_size=n)` via
+  `__call__`). Never call `bridge.step(...)`.
+- **Non-finite floats must be sanitized before telemetry.** `client.push_telemetry` JSON-encodes the payload and
+  **raises** on `inf`/`nan` (and `push_telemetry` then swallows it, so the push is silently lost). Coerce
+  non-finite `loss`/`grad_norm`/`metrics`/`per_sample_losses`/anomaly values to `None` (or drop them) before they
+  enter `TrainingState` — guard with `math.isfinite`. This matters most during divergence, exactly when the agent
+  needs to see the anomaly.
+- **Distributed paths are gated on `dist.is_available()`.** The bridge references the module-global `dist`
+  (`from . import distributed as dist`); every collective is guarded so single-process and CI behave identically.
+  Under DDP, only rank 0 pushes telemetry and drains commands, then broadcasts the processed commands so all ranks
+  apply the same mutation at the same step (`_NON_REPLICATED` is excluded). Keep the per-`drain_commands` collective
+  count identical across ranks — an unmatched broadcast hangs the process group.
+- **In-memory checkpoints must clone tensors.** `torch` `state_dict()` returns tensors that **alias** live
+  params, so an in-memory snapshot must `.detach().clone()` (recursively for optimizer state) or
+  `restore_checkpoint` becomes a silent no-op once `optimizer.step()` mutates them. The `checkpoint_dir`
+  (`torch.save`) path is already safe.
 - **Backward-compatible contract changes.** New fields/params default to preserve today's behavior
   (`run_id="default"`, new `on_batch_end(..., sample_indices=None, sample_losses=None)` kwargs optional). Existing
   loops and tests call hooks with old signatures.
@@ -69,8 +107,10 @@ queue → bridge claims with a lease (background poller or sync point) → runs 
   204 carries a body); clients treat `204` as `None`. Don't add a body to a 204.
 - **In-process tests use `ControlPlaneClient.from_app(app)`** (starlette `TestClient`), because
   `httpx.ASGITransport` is async-only. Prefer this over real sockets in tests.
-- **`__init__.py` lazy-exports** `TrainingBridge`, `HandlerRegistry`, `OptunaAdvisor`, `optuna_available`,
-  `AgenticCallback` via `__getattr__` to keep the top-level import torch/fastapi-free.
+- **`__init__.py` lazy-exports** `TrainingBridge`, `NoOpBridge`, `attach`, `HandlerRegistry`, `OptunaAdvisor`,
+  `optuna_available`, `AgenticCallback` via `__getattr__` to keep the top-level import torch/fastapi-free. The new
+  contract models (`SchedulerState`, `ProfileSummary`, `CheckpointInfo`, `AnomalyEvent`, `GuardrailConfig`, …) are
+  eagerly re-exported (pure-pydantic, no heavy deps).
 
 ## Env vars
 
@@ -80,8 +120,10 @@ queue → bridge claims with a lease (background poller or sync point) → runs 
 
 ## Where things live
 
-`src/agentic_optimizer/`: `contract.py`, `controlplane.py` (broker + httpx client), `bridge.py`
-(`TrainingBridge` + `HandlerRegistry`), `mcp_server.py` (FastMCP tools + impls), `telemetry.py`,
-`optuna_advisor.py`, `callback.py`/`driver.py` (legacy). Runnable `examples/` (`run_broker.py`,
-`train_with_bridge.py`, `agent_sim.py`, `live_demo.py`). Docs in `README.md`, `docs/`, `agent/`, `docker/`,
+`src/agentic_optimizer/`: `contract.py`, `controlplane.py` (broker + httpx client + `--tunnel`), `bridge.py`
+(`TrainingBridge` + `HandlerRegistry` + `attach`/`NoOpBridge`), `mcp_server.py` (FastMCP tools + impls),
+`telemetry.py`, `safety.py` (anomaly + guardrails), `profiling.py` (`StepProfiler`), `distributed.py` (DDP),
+`tunnel.py` (Dev Tunnel), `integrations/` (`lightning.py`, `hf.py` callbacks), `optuna_advisor.py`,
+`callback.py`/`driver.py` (legacy). Runnable `examples/` (`run_broker.py`, `minimal_bridge.py` = 3-line `attach`
+demo, `train_with_bridge.py`, `agent_sim.py`, `live_demo.py`). Docs in `README.md`, `docs/`, `agent/`, `docker/`,
 `auth/`.

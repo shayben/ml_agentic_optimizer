@@ -227,6 +227,126 @@ def get_suspicious_samples_impl(
     }
 
 
+# ---- checkpoint / rollback
+@_safe_impl
+def save_checkpoint_impl(
+    client: ControlPlaneClient,
+    note: str | None = None,
+    metrics: dict[str, float] | None = None,
+    checkpoint_id: str | None = None,
+    timeout: float = 60.0,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    args = {
+        k: v
+        for k, v in {"note": note, "metrics": metrics, "id": checkpoint_id}.items()
+        if v is not None
+    }
+    queued = _enqueue(client, "save_checkpoint", args, run_id)
+    if "error" in queued:
+        return queued
+    return wait_for_result_impl(client, queued["command_id"], timeout, run_id)
+
+
+@_safe_impl
+def restore_checkpoint_impl(
+    client: ControlPlaneClient,
+    checkpoint_id: str | None = None,
+    timeout: float = 60.0,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    args = {"id": checkpoint_id} if checkpoint_id else {}
+    queued = _enqueue(client, "restore_checkpoint", args, run_id)
+    if "error" in queued:
+        return queued
+    return wait_for_result_impl(client, queued["command_id"], timeout, run_id)
+
+
+@_safe_impl
+def list_checkpoints_impl(
+    client: ControlPlaneClient, run_id: str | None = None
+) -> dict[str, Any]:
+    t = client.get_telemetry(_active_run_id(run_id))
+    if t is None:
+        return {"available": False}
+    return {"available": True, "checkpoints": [c.model_dump() for c in t.checkpoints]}
+
+
+# ---- guardrails
+@_safe_impl
+def set_guardrails_impl(
+    client: ControlPlaneClient,
+    bounds: dict[str, dict[str, float]] | None = None,
+    max_rel_change: float | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if bounds is not None:
+        args["bounds"] = bounds
+    if max_rel_change is not None:
+        args["max_rel_change"] = max_rel_change
+    return _enqueue(client, "set_guardrails", args, run_id)
+
+
+# ---- profiler / scheduler
+@_safe_impl
+def get_profile_impl(client: ControlPlaneClient, run_id: str | None = None) -> dict[str, Any]:
+    t = client.get_telemetry(_active_run_id(run_id))
+    if t is None or t.state.profile is None:
+        return {"available": False}
+    return {"available": True, **t.state.profile.model_dump()}
+
+
+@_safe_impl
+def get_scheduler_impl(client: ControlPlaneClient, run_id: str | None = None) -> dict[str, Any]:
+    t = client.get_telemetry(_active_run_id(run_id))
+    if t is None or t.state.scheduler is None:
+        return {"available": False}
+    return {"available": True, **t.state.scheduler.model_dump()}
+
+
+@_safe_impl
+def set_scheduler_impl(
+    client: ControlPlaneClient,
+    config: dict[str, Any] | None = None,
+    timeout: float = 60.0,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    queued = _enqueue(client, "set_scheduler", config or {}, run_id)
+    if "error" in queued:
+        return queued
+    return wait_for_result_impl(client, queued["command_id"], timeout, run_id)
+
+
+# ---- run lifecycle
+@_safe_impl
+def stop_training_impl(client: ControlPlaneClient, run_id: str | None = None) -> dict[str, Any]:
+    return _enqueue(client, "stop_training", {}, run_id)
+
+
+@_safe_impl
+def extend_training_impl(
+    client: ControlPlaneClient, max_epochs: int, run_id: str | None = None
+) -> dict[str, Any]:
+    return _enqueue(client, "extend_training", {"max_epochs": int(max_epochs)}, run_id)
+
+
+# ---- anomalies
+@_safe_impl
+def get_anomalies_impl(
+    client: ControlPlaneClient, limit: int = 20, run_id: str | None = None
+) -> dict[str, Any]:
+    t = client.get_telemetry(_active_run_id(run_id))
+    if t is None or not t.anomalies:
+        return {"available": False}
+    items = t.anomalies[-limit:]
+    return {
+        "available": True,
+        "count": len(items),
+        "anomalies": [a.model_dump() for a in items],
+    }
+
+
 @_safe_impl
 def invoke_and_wait_impl(
     client: ControlPlaneClient,
@@ -454,6 +574,73 @@ def build_server(client: ControlPlaneClient):
     def hpo_best() -> dict[str, Any] | None:
         """Return the best completed Optuna trial, used after the HPO loop finalizes."""
         return hpo_best_impl()
+
+    @mcp.tool()
+    def save_checkpoint(
+        note: str | None = None,
+        metrics: dict[str, float] | None = None,
+        checkpoint_id: str | None = None,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        """Snapshot the live run (weights/optimizer/scheduler/RNG) so you can roll back later.
+
+        Waits for the job to apply it and returns the checkpoint id."""
+        return save_checkpoint_impl(client, note, metrics, checkpoint_id, timeout)
+
+    @mcp.tool()
+    def restore_checkpoint(
+        checkpoint_id: str | None = None, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Roll the run back to a saved checkpoint (latest if checkpoint_id omitted); waits for apply."""
+        return restore_checkpoint_impl(client, checkpoint_id, timeout)
+
+    @mcp.tool()
+    def list_checkpoints() -> dict[str, Any]:
+        """List checkpoints saved this run (id, step, epoch, metrics, note) for rollback selection."""
+        return list_checkpoints_impl(client)
+
+    @mcp.tool()
+    def set_guardrails(
+        bounds: dict[str, dict[str, float]] | None = None,
+        max_rel_change: float | None = None,
+    ) -> dict[str, Any]:
+        """Set safety bounds for live hyperparameter changes.
+
+        ``bounds`` maps a name (lr/weight_decay/momentum/grad_clip) to ``{min, max}``;
+        ``max_rel_change`` caps the per-change fractional delta. Out-of-range values are clamped."""
+        return set_guardrails_impl(client, bounds, max_rel_change)
+
+    @mcp.tool()
+    def get_profile() -> dict[str, Any]:
+        """Step-time breakdown (dataloader vs fwd/bwd vs H2D) with throughput-tuning suggestions."""
+        return get_profile_impl(client)
+
+    @mcp.tool()
+    def get_scheduler() -> dict[str, Any]:
+        """The live LR scheduler's state (name, last_lr, last_epoch, config) if one is attached."""
+        return get_scheduler_impl(client)
+
+    @mcp.tool()
+    def set_scheduler(
+        config: dict[str, Any] | None = None, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Reconfigure/replace the LR scheduler (job-defined hook); waits for apply and returns state."""
+        return set_scheduler_impl(client, config, timeout)
+
+    @mcp.tool()
+    def stop_training() -> dict[str, Any]:
+        """Request a graceful stop; the loop exits at the next epoch boundary and frees the GPU."""
+        return stop_training_impl(client)
+
+    @mcp.tool()
+    def extend_training(max_epochs: int) -> dict[str, Any]:
+        """Raise the run's max_epochs so a promising run can keep training past its original budget."""
+        return extend_training_impl(client, max_epochs)
+
+    @mcp.tool()
+    def get_anomalies(limit: int = 20) -> dict[str, Any]:
+        """Recent training anomalies (NaN/Inf loss, grad explosion, loss divergence) the job detected."""
+        return get_anomalies_impl(client, limit)
 
     return mcp
 

@@ -40,6 +40,41 @@ class PerSampleLoss(BaseModel):
     loss: float
 
 
+class SchedulerState(BaseModel):
+    """Snapshot of the LR scheduler so the agent can see (and replace) the schedule."""
+
+    name: str | None = None
+    last_lr: list[float] = Field(default_factory=list)
+    last_epoch: int | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProfileSection(BaseModel):
+    """One timed region of the training step (e.g. dataloader/forward/backward/optimizer)."""
+
+    name: str
+    ms_avg: float
+    pct: float
+
+
+class ProfileSummary(BaseModel):
+    """Per-region step-time breakdown for hardware/throughput root-cause analysis."""
+
+    steps: int = 0
+    step_ms_avg: float | None = None
+    sections: list[ProfileSection] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+
+
+class DistributedInfo(BaseModel):
+    """DDP/multi-rank context for the run (single-process: enabled=False, world_size=1)."""
+
+    enabled: bool = False
+    rank: int = 0
+    world_size: int = 1
+    backend: str | None = None
+
+
 class TrainingState(BaseModel):
     """Snapshot of training health written to ``state.json`` for the agent to read."""
 
@@ -54,6 +89,10 @@ class TrainingState(BaseModel):
     throughput_samples_per_s: float | None = None
     gpu: GpuTelemetry | None = None
     per_sample_losses: list[PerSampleLoss] = Field(default_factory=list, max_length=200_000)
+    scheduler: SchedulerState | None = None
+    profile: ProfileSummary | None = None
+    distributed: DistributedInfo | None = None
+    stop_requested: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)
 
     def to_json(self, indent: int = 2) -> str:
@@ -255,6 +294,43 @@ class MlflowInfo(BaseModel):
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
+class CheckpointInfo(BaseModel):
+    """A checkpoint the bridge saved and can roll the live run back to."""
+
+    id: str
+    step: int = 0
+    epoch: int = 0
+    created_at: float = Field(default_factory=time.time)
+    metrics: dict[str, float] = Field(default_factory=dict)
+    path: str | None = None
+    note: str | None = None
+
+
+class AnomalyEvent(BaseModel):
+    """A training-health anomaly the bridge detected (NaN/Inf, grad explosion, divergence)."""
+
+    kind: str
+    message: str
+    value: float | None = None
+    step: int | None = None
+    epoch: int | None = None
+    at: float = Field(default_factory=time.time)
+
+
+class GuardrailBound(BaseModel):
+    """Inclusive [min, max] bound for a single guardrailed knob (either may be null)."""
+
+    min: float | None = None
+    max: float | None = None
+
+
+class GuardrailConfig(BaseModel):
+    """Bounds + max relative-change-per-call the bridge enforces on hyperparameter mutations."""
+
+    bounds: dict[str, GuardrailBound] = Field(default_factory=dict)
+    max_rel_change: float | None = None
+
+
 class Telemetry(BaseModel):
     """A telemetry snapshot pushed by the bridge: training state + MLflow linkage + flags."""
 
@@ -264,4 +340,8 @@ class Telemetry(BaseModel):
     paused: bool = False
     knobs: list[KnobSpec] = Field(default_factory=list)
     last_error: str | None = None
+    checkpoints: list[CheckpointInfo] = Field(default_factory=list)
+    anomalies: list[AnomalyEvent] = Field(default_factory=list)
+    guardrails: GuardrailConfig | None = None
+    stopping: bool = False
 
