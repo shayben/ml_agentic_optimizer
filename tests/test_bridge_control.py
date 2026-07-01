@@ -140,6 +140,7 @@ def test_checkpoint_eviction_respects_max_checkpoints():
 
 
 def test_checkpoint_disk_roundtrip(tmp_path):
+    pytest.importorskip("torch")  # the disk path uses torch.save/torch.load
     model = FakeModule(val=3.0)
     bridge, opt, client = make_bridge(model=model, checkpoint_dir=str(tmp_path))
     saved = bridge.save_checkpoint(checkpoint_id="disk")
