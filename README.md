@@ -16,7 +16,8 @@ and drive optional HPO.
 - **Steer hardware/throughput** — `batch_size`, `num_workers`, `grad_accum_steps`, `amp` (via your callback).
 - **Control the schedule** — read scheduler state and reconfigure the LR scheduler mid-run.
 - **Interrogate** — per-class loss or any custom model/data query you register, mid-run.
-- **Fix data** — pull the highest per-sample losses and flag likely label noise to down-weight or filter.
+- **Fix data & robustness** — pull the highest per-sample losses and flag likely label noise to down-weight or
+  filter, and toggle data augmentation mid-run (`set_augmentation`).
 - **Train safely** — **checkpoint + rollback** a bad change, **guardrails** clamp unsafe hyperparameters, and
   **anomaly auto-pause** halts on NaN/Inf/grad-explosion.
 - **Profile** — a built-in step-time breakdown (data-wait vs forward vs backward) for throughput RCA.
@@ -74,8 +75,8 @@ The remote node does **not** need FastAPI, uvicorn, MCP, or the Copilot CLI.
 
 Observe and control: `get_training_state`, `get_metrics`, `get_mlflow_info`, `list_knobs`, `list_runs`,
 `select_run`, `set_hyperparameters`, `set_training_config`, `set_knob`, `invoke`, `interrogate`,
-`invoke_and_wait`, `interrogate_and_wait`, `get_suspicious_samples`, `flag_samples`, `run_evaluation`,
-`pause_training`, `resume_training`, and `wait_for_result`.
+`invoke_and_wait`, `interrogate_and_wait`, `get_suspicious_samples`, `flag_samples`, `set_augmentation`,
+`run_evaluation`, `pause_training`, `resume_training`, and `wait_for_result`.
 
 Safe live control and lifecycle: `save_checkpoint`, `restore_checkpoint`, `list_checkpoints`, `set_guardrails`,
 `get_profile`, `get_scheduler`, `set_scheduler`, `get_anomalies`, `stop_training`, and `extend_training`.
@@ -256,12 +257,15 @@ namespaced by it, so many training jobs can share one broker. The agent calls `l
 - **Broker auth** is a privileged bearer token (`CONTROL_PLANE_TOKEN`) that can mutate live training.
 - Use TLS or an SSH tunnel for any non-loopback broker. Store the token in Key Vault/AML secrets or another
   secret manager and set it on the broker, node, and local CLI side.
-- The broker uses constant-time token comparison, request-size limits (`CONTROL_PLANE_MAX_BODY_BYTES`), and refuses
-  non-loopback tokenless binding unless `CONTROL_PLANE_INSECURE=1`.
+- The broker uses constant-time token comparison, request-size limits (`CONTROL_PLANE_MAX_BODY_BYTES`), and
+  **refuses to start** an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind unless
+  `CONTROL_PLANE_INSECURE=1` (a loopback-only bind with no token is still allowed).
 - Optional SQLite persistence: set `CONTROL_PLANE_PERSIST=<path.db>` on the broker.
 - **No third endpoint, via Dev Tunnel:** run `agentic-optimizer-broker --tunnel` to bind the broker to localhost
   *and* publish a public HTTPS URL through Microsoft Dev Tunnels (requires the `devtunnel` CLI). The printed URL is
-  what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Always pair with a token.
+  what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Because a tunnel is
+  public, the broker **requires** `CONTROL_PLANE_TOKEN` for `--tunnel` (override with `CONTROL_PLANE_INSECURE=1`,
+  unsafe).
 
 ## Containers
 

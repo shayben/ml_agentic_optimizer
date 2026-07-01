@@ -72,8 +72,11 @@ entry point — see the conventions below.
   read-only / non-torch-mutating**; everything that mutates the loop or torch state (`set_hyperparameters`,
   `set_training_config`, `set_knob`, `set_augmentation`, `set_scheduler`, `save_checkpoint`, `restore_checkpoint`,
   `run_evaluation`) is **deferred** to a training-thread sync point (`drain_commands` at `on_epoch_end`). When you
-  add a command, classify it here; anything touching tensors/optimizer/model must be deferred. `_poll_once()` is
-  split out for deterministic testing.
+  add a command, classify it here; anything touching tensors/optimizer/model must be deferred. A `safe_async`
+  handler may update plain Python bookkeeping immediately, but if it must fire a caller-supplied callback that
+  touches tensors (e.g. `flag_samples` updates `flagged_indices` inline yet queues `on_flagged_samples`), it
+  enqueues the work and lets `drain_commands` run it on the training thread via `_flush_flag_callbacks` — never
+  call such a callback inline on the poller thread. `_poll_once()` is split out for deterministic testing.
 - **`attach()` returns a `NoOpBridge` off the control plane — and it must still TRAIN.** `attach(optimizer, model)`
   (== `TrainingBridge.from_env`) returns a live bridge when `CONTROL_PLANE_URL` is set and a `NoOpBridge`
   otherwise, so the *same* script runs unchanged. `NoOpBridge` is **not fully inert**: `train_step`/`__call__`
@@ -97,7 +100,8 @@ entry point — see the conventions below.
 - **In-memory checkpoints must clone tensors.** `torch` `state_dict()` returns tensors that **alias** live
   params, so an in-memory snapshot must `.detach().clone()` (recursively for optimizer state) or
   `restore_checkpoint` becomes a silent no-op once `optimizer.step()` mutates them. The `checkpoint_dir`
-  (`torch.save`) path is already safe.
+  (`torch.save`) path is already safe. Re-saving an existing checkpoint id **pops-then-reinserts** it so it moves
+  to newest — restore-latest (no id) and LRU eviction both key off `dict` insertion order.
 - **Backward-compatible contract changes.** New fields/params default to preserve today's behavior
   (`run_id="default"`, new `on_batch_end(..., sample_indices=None, sample_losses=None)` kwargs optional). Existing
   loops and tests call hooks with old signatures.
@@ -116,7 +120,10 @@ entry point — see the conventions below.
 
 - Local + node clients: `CONTROL_PLANE_URL`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_RUN_ID`.
 - Broker: `CONTROL_PLANE_HOST`, `CONTROL_PLANE_PORT`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_PERSIST`,
-  `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1` (allow non-loopback without a token — unsafe).
+  `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1`. Broker startup (`controlplane._check_exposure`)
+  **refuses** to serve an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind
+  (anyone reachable could drive the run); set `CONTROL_PLANE_TOKEN`, or `CONTROL_PLANE_INSECURE=1` to override
+  (unsafe). A loopback bind with no token is allowed.
 
 ## Where things live
 
@@ -125,5 +132,6 @@ entry point — see the conventions below.
 `telemetry.py`, `safety.py` (anomaly + guardrails), `profiling.py` (`StepProfiler`), `distributed.py` (DDP),
 `tunnel.py` (Dev Tunnel), `integrations/` (`lightning.py`, `hf.py` callbacks), `optuna_advisor.py`,
 `callback.py`/`driver.py` (legacy). Runnable `examples/` (`run_broker.py`, `minimal_bridge.py` = 3-line `attach`
-demo, `train_with_bridge.py`, `agent_sim.py`, `live_demo.py`). Docs in `README.md`, `docs/`, `agent/`, `docker/`,
-`auth/`.
+demo, `train_with_bridge.py`, `agent_sim.py`, `live_demo.py`; `cifar10_resnet.py` = the legacy
+`AgenticCallback`/driver `state.json`/`control.json` demo, runs offline with `--fake-data`; `aml_job.yml` = an
+Azure ML job spec). Docs in `README.md`, `docs/`, `agent/`, `docker/`, `auth/`.
