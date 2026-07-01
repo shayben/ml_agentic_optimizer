@@ -3,8 +3,10 @@
 [![CI](https://github.com/shayben/ml_agentic_optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/shayben/ml_agentic_optimizer/actions/workflows/ci.yml)
 
 Give a **local agent** (your interactive **GitHub Copilot CLI** session) live, two-way access to one or more
-**remote PyTorch training runs** through a local **MCP stdio server** and a reachable HTTP broker. The agent can
-stream telemetry/metrics (including **MLflow**), diagnose training, and interject mid-run: tune optimizer
+**remote PyTorch training runs**. Everything except the training job runs on your machine — a local **MCP stdio
+server** plus a local **broker** published to the node over a **Microsoft Dev Tunnel**, so there is **no
+separately-hosted broker or third endpoint**. The agent can stream telemetry/metrics (including **MLflow**),
+diagnose training, and interject mid-run: tune optimizer
 hyperparameters, adjust throughput/hardware settings, queue data/model interrogations, flag suspicious samples,
 and drive optional HPO.
 
@@ -29,24 +31,26 @@ Runs on a raw loop, **PyTorch Lightning**, or **Hugging Face `Trainer`**, and sc
 a broker.
 
 ```
- Local dev box                         Reachable control plane                    Remote node (AML/GPU)
- ┌────────────────────┐ MCP stdio       ┌────────────────────────┐ HTTP/REST       ┌──────────────────────┐
- │ GitHub Copilot CLI │◄───────────────►│ broker (FastAPI)       │◄───────────────►│ PyTorch training loop │
- │ + mcp-config       │ mcp_server      │ telemetry/queues/runs  │ telemetry ↑     │ + TrainingBridge      │
- └────────────────────┘                 │ bearer-token auth      │ commands  ↓     │ + callbacks/handlers  │
-                                        └────────────────────────┘ results   ↑     └──────────────────────┘
+ Local dev box  (agent + broker — nothing hosted separately)          Remote node (AML/GPU)
+ ┌────────────────────────────────────────────────┐                   ┌───────────────────────┐
+ │ GitHub Copilot CLI ─MCP stdio─► mcp_server      │     Dev Tunnel     │ PyTorch training loop  │
+ │ broker (FastAPI, --tunnel)                      │  public HTTPS URL  │ + TrainingBridge       │
+ │ telemetry · queues · runs · bearer-token auth   │◄══════════════════►│ + callbacks/handlers   │
+ └────────────────────────────────────────────────┘  telemetry ↑       └───────────────────────┘
+                                                      commands/results ↓
 ```
 
-Only the **broker** needs a network address. The Copilot CLI and MCP server run on your **local** machine, not on
-the training node. Or skip the separate broker entirely with the built-in **Dev Tunnel** mode
-(`agentic-optimizer-broker --tunnel`), which publishes a public HTTPS URL for the node to reach. See
+The Copilot CLI, MCP server, **and broker** all run on your **local** machine; only the training job is remote.
+`agentic-optimizer-broker --tunnel` binds the broker to localhost and publishes it to the node through a
+**Microsoft Dev Tunnel** (a public HTTPS URL) — no separately-hosted broker or third endpoint required. Prefer a
+fixed, shared endpoint? You can still self-host the broker on any reachable host and point both sides at it. See
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Components
 
 | Module | Role |
 | --- | --- |
-| `agentic_optimizer.controlplane` | FastAPI broker (`agentic-optimizer-broker`), in-memory or SQLite-backed, bearer-token protected; optional Dev Tunnel. |
+| `agentic_optimizer.controlplane` | FastAPI broker (`agentic-optimizer-broker`), in-memory or SQLite-backed, bearer-token protected; publishes itself to the node via Dev Tunnel (`--tunnel`). |
 | `agentic_optimizer.bridge` | `TrainingBridge` — remote-side glue in the PyTorch loop (+ `attach`/`NoOpBridge` ergonomics). |
 | `agentic_optimizer.mcp_server` | MCP **stdio** server exposing control tools to the local CLI. |
 | `agentic_optimizer.contract` | Shared pydantic models for telemetry, commands, run IDs, and results. |
@@ -87,16 +91,17 @@ If installed with `[hpo]`, optional advisor tools are also available: `hpo_confi
 ## Quick start
 
 ```bash
-# 1) broker (the only reachable component)
+# 1) broker — runs locally and publishes itself via Dev Tunnel (needs the `devtunnel` CLI).
+#    Prints a public HTTPS URL for the node to use as <broker-url> below. No 3rd endpoint to host.
 pip install -e ".[broker]"
-CONTROL_PLANE_TOKEN=<strong-token> CONTROL_PLANE_HOST=0.0.0.0 agentic-optimizer-broker
-# …or publish it without hosting a separate endpoint (prints a public HTTPS URL to use below):
 CONTROL_PLANE_TOKEN=<strong-token> agentic-optimizer-broker --tunnel
+# Alternative — self-host a fixed, reachable broker instead of a tunnel:
+#   CONTROL_PLANE_TOKEN=<strong-token> CONTROL_PLANE_HOST=0.0.0.0 agentic-optimizer-broker
 
-# 2) remote training job (AML/GPU node), pointed at the broker
+# 2) remote training job (AML/GPU node), pointed at the tunnel URL
 pip install -e ".[torch,gpu,mlflow]"
-CONTROL_PLANE_URL=https://<broker-host> CONTROL_PLANE_TOKEN=<strong-token> \
-  CONTROL_PLANE_RUN_ID=run-001 python examples/train_with_bridge.py --broker https://<broker-host>
+CONTROL_PLANE_URL=<broker-url> CONTROL_PLANE_TOKEN=<strong-token> \
+  CONTROL_PLANE_RUN_ID=run-001 python examples/train_with_bridge.py --broker <broker-url>
 
 # 3) local agent — Copilot CLI starts the MCP stdio server from agent/mcp-config.json
 pip install -e ".[mcp,hpo]"
@@ -255,17 +260,18 @@ namespaced by it, so many training jobs can share one broker. The agent calls `l
 ## Auth & hosting
 
 - **Broker auth** is a privileged bearer token (`CONTROL_PLANE_TOKEN`) that can mutate live training.
-- Use TLS or an SSH tunnel for any non-loopback broker. Store the token in Key Vault/AML secrets or another
-  secret manager and set it on the broker, node, and local CLI side.
+- Store the token in Key Vault/AML secrets or another secret manager and set it on the broker, node, and local CLI
+  side. If you self-host a broker instead of tunnelling, put TLS (or an SSH tunnel) in front of any non-loopback
+  bind.
 - The broker uses constant-time token comparison, request-size limits (`CONTROL_PLANE_MAX_BODY_BYTES`), and
   **refuses to start** an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind unless
   `CONTROL_PLANE_INSECURE=1` (a loopback-only bind with no token is still allowed).
 - Optional SQLite persistence: set `CONTROL_PLANE_PERSIST=<path.db>` on the broker.
-- **No third endpoint, via Dev Tunnel:** run `agentic-optimizer-broker --tunnel` to bind the broker to localhost
-  *and* publish a public HTTPS URL through Microsoft Dev Tunnels (requires the `devtunnel` CLI). The printed URL is
-  what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Because a tunnel is
-  public, the broker **requires** `CONTROL_PLANE_TOKEN` for `--tunnel` (override with `CONTROL_PLANE_INSECURE=1`,
-  unsafe).
+- **Default — no third endpoint (Dev Tunnel):** run `agentic-optimizer-broker --tunnel` to bind the broker to
+  localhost *and* publish a public HTTPS URL through Microsoft Dev Tunnels (requires the `devtunnel` CLI). The
+  printed URL is what the remote node uses as `CONTROL_PLANE_URL` — no separately hosted broker required. Because a
+  tunnel is public, the broker **requires** `CONTROL_PLANE_TOKEN` for `--tunnel` (override with
+  `CONTROL_PLANE_INSECURE=1`, unsafe).
 
 ## Containers
 
@@ -312,7 +318,7 @@ docs/ · agent/ · docker/ · auth/
 
 | File | What it is |
 | --- | --- |
-| [`examples/run_broker.py`](examples/run_broker.py) | Start the broker (the only reachable component). |
+| [`examples/run_broker.py`](examples/run_broker.py) | Start a local broker for the demo (loopback); for a public tunnel use `agentic-optimizer-broker --tunnel`. |
 | [`examples/minimal_bridge.py`](examples/minimal_bridge.py) | Smallest integration: `attach` + `train_step` in a vanilla loop (runs standalone as a no-op). |
 | [`examples/train_with_bridge.py`](examples/train_with_bridge.py) | Remote-style PyTorch job exercising the full surface (scheduler, profiler, guardrails, checkpoints, label noise). |
 | [`examples/agent_sim.py`](examples/agent_sim.py) | Scripted stand-in for the CLI agent; drives the same MCP tool impls. |
