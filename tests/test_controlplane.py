@@ -9,6 +9,7 @@ from agentic_optimizer.controlplane import (
     ControlPlaneClient,
     ControlPlaneStore,
     _check_exposure,
+    _client_headers,
     create_app,
 )
 
@@ -184,6 +185,44 @@ def test_check_exposure_token_permits_tunnel_and_non_loopback():
 
 def test_check_exposure_insecure_optout_permits_exposure():
     _check_exposure(token=None, tunnel=True, host="0.0.0.0", insecure=True)
+
+
+def test_check_exposure_non_anonymous_tunnel_ok_without_token():
+    # A non-anonymous tunnel is gated by the Dev Tunnels relay, so it is an auth layer on its own.
+    _check_exposure(token=None, tunnel=True, host="127.0.0.1", insecure=False, tunnel_anonymous=False)
+
+
+def test_check_exposure_anonymous_tunnel_still_refused():
+    with pytest.raises(SystemExit):
+        _check_exposure(
+            token=None, tunnel=True, host="127.0.0.1", insecure=False, tunnel_anonymous=True
+        )
+
+
+def test_client_headers_assembles_two_layers():
+    assert _client_headers("bt", "ct") == {
+        "Authorization": "Bearer bt",
+        "X-Tunnel-Authorization": "tunnel ct",
+    }
+    assert _client_headers(None, "ct") == {"X-Tunnel-Authorization": "tunnel ct"}
+    assert _client_headers("bt", None) == {"Authorization": "Bearer bt"}
+    assert _client_headers(None, None) == {}
+
+
+def test_from_url_sets_tunnel_authorization_header():
+    c = ControlPlaneClient.from_url("http://x", "bt", tunnel_access_token="ct")
+    headers = c._client.headers
+    assert headers["authorization"] == "Bearer bt"
+    assert headers["x-tunnel-authorization"] == "tunnel ct"
+
+
+def test_from_env_reads_tunnel_access_token(monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://x")
+    monkeypatch.setenv("CONTROL_PLANE_TOKEN", "bt")
+    monkeypatch.setenv("CONTROL_PLANE_TUNNEL_ACCESS_TOKEN", "ct")
+    c = ControlPlaneClient.from_env()
+    assert c is not None
+    assert c._client.headers["x-tunnel-authorization"] == "tunnel ct"
 
 
 def test_max_body_413():

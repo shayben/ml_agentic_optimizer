@@ -235,6 +235,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--broker", default=os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8765"))
     ap.add_argument("--token", default=os.environ.get("CONTROL_PLANE_TOKEN"))
+    ap.add_argument("--tunnel-access-token",
+                    default=os.environ.get("CONTROL_PLANE_TUNNEL_ACCESS_TOKEN"),
+                    help="Dev Tunnels connect token for a non-anonymous tunnel "
+                         "(sent as the X-Tunnel-Authorization header)")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=0.2)
     ap.add_argument("--run-id", default=os.environ.get("CONTROL_PLANE_RUN_ID", "default"))
@@ -244,7 +248,9 @@ def main() -> None:
     ap.add_argument("--mlflow", action="store_true", help="link an active MLflow run into telemetry")
     args = ap.parse_args()
 
-    client = ControlPlaneClient.from_url(args.broker, args.token)
+    client = ControlPlaneClient.from_url(
+        args.broker, args.token, tunnel_access_token=args.tunnel_access_token
+    )
     if not client.health():
         raise SystemExit(f"broker not reachable at {args.broker}")
     run_training(

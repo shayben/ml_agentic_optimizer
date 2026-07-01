@@ -648,7 +648,8 @@ def build_server(client: ControlPlaneClient):
 def client_from_env() -> ControlPlaneClient:
     url = os.environ.get("CONTROL_PLANE_URL", DEFAULT_URL)
     token = os.environ.get("CONTROL_PLANE_TOKEN")
-    return ControlPlaneClient.from_url(url, token)
+    tunnel_access_token = os.environ.get("CONTROL_PLANE_TUNNEL_ACCESS_TOKEN")
+    return ControlPlaneClient.from_url(url, token, tunnel_access_token=tunnel_access_token)
 
 
 def main() -> None:

@@ -101,6 +101,57 @@ def run_login(
         raise TunnelError(f"Dev Tunnels login failed ({' '.join(login_cmd)}){detail}")
 
 
+_ACCESS_TOKEN_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+def parse_connect_token(output: str) -> str | None:
+    """Extract a Dev Tunnels access token (a JWT) from ``devtunnel token`` output.
+
+    The preview CLI prints the token with a surrounding label (e.g. ``Tunnel access token: eyJ...``)
+    whose exact wording changes between versions, so we match the JWT itself rather than the label.
+    """
+    match = _ACCESS_TOKEN_RE.search(output or "")
+    return match.group(0) if match else None
+
+
+def issue_connect_token(
+    tunnel_id: str,
+    *,
+    scopes: str = "connect",
+    cmd: str = "devtunnel",
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Mint a Dev Tunnels **connect** token for ``tunnel_id`` so clients can reach a non-anonymous
+    tunnel without their own interactive login.
+
+    Runs ``devtunnel token <id> --scopes connect`` (the host must already be authenticated with a
+    *manage* scope over the tunnel — true on your local box, or on a node after :func:`run_login`).
+    The returned token is handed to clients via ``CONTROL_PLANE_TUNNEL_ACCESS_TOKEN`` and forwarded
+    as the ``X-Tunnel-Authorization`` header.
+
+    .. warning::
+       Connect tokens **expire after ~24 hours** and can only be refreshed by a real user identity
+       holding *manage* scope. For runs longer than a day, re-issue periodically, or grant access to
+       an Entra tenant (``--tenant``) / GitHub org (``--organization``) instead of distributing a
+       token — see the non-anonymous docs.
+    """
+    argv = [cmd, "token", tunnel_id, "--scopes", scopes]
+    try:
+        result = run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        raise TunnelError(f"Dev Tunnels token command failed to start: {exc}") from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise TunnelError(f"Dev Tunnels token issuance failed ({' '.join(argv)}){detail}")
+    token = parse_connect_token(result.stdout or "")
+    if not token:
+        raise TunnelError(
+            f"could not parse a connect token from `{' '.join(argv)}` output"
+        )
+    return token
+
+
 def parse_tunnel_url(line: str) -> str | None:
     """Extract the first public ``https://*.devtunnels.ms`` URL from a devtunnel line."""
     match = _DEV_TUNNEL_URL_RE.search(line)

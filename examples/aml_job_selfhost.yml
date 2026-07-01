@@ -45,6 +45,13 @@ environment_variables:
   # the agent's CONTROL_PLANE_URL (not needed if you rely on the deterministic --tunnel-id URL).
   CONTROL_PLANE_TUNNEL_URL_FILE: ${{outputs.outputs}}/tunnel_url.txt
 
+  # OPTIONAL — make the tunnel NON-ANONYMOUS (the Dev Tunnels relay rejects unauthenticated clients
+  # before requests reach the broker). The node then mints a short-lived CONNECT token and writes it
+  # to the outputs; copy it into the agent's CONTROL_PLANE_TUNNEL_ACCESS_TOKEN. NOTE: connect tokens
+  # expire after ~24h, so for longer runs prefer tenant/org access (devtunnel access create ...).
+  #   CONTROL_PLANE_TUNNEL_ANONYMOUS: "0"
+  #   CONTROL_PLANE_TUNNEL_TOKEN_FILE: ${{outputs.outputs}}/tunnel_token.txt
+
 outputs:
   outputs:
     type: uri_folder

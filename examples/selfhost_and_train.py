@@ -17,6 +17,11 @@ no "bring the broker up before submitting" ordering constraint. Pair it with a p
 Hosting a tunnel from a headless node requires *non-interactive* Dev Tunnels authentication (the
 ``--allow-anonymous`` flag only grants clients access; the host must be logged in). Provide it via
 ``--tunnel-login`` / ``$CONTROL_PLANE_TUNNEL_LOGIN`` (for example an access-token wrapper).
+
+By default the tunnel allows anonymous clients (the broker's bearer token is the only gate). Pass
+``--no-tunnel-anonymous`` to make the relay itself reject unauthenticated clients; the node then mints
+a **connect token** (``--token-file``) that the agent supplies via ``CONTROL_PLANE_TUNNEL_ACCESS_TOKEN``.
+Connect tokens expire after ~24h — see the README "non-anonymous" section for the trade-offs.
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ import time
 from pathlib import Path
 
 from agentic_optimizer.controlplane import ControlPlaneClient, ControlPlaneStore, create_app
-from agentic_optimizer.tunnel import serve_with_tunnel
+from agentic_optimizer.tunnel import TunnelError, issue_connect_token, serve_with_tunnel
 
 # ``run_training`` lives alongside this file in examples/; import it directly.
 from train_with_bridge import run_training
@@ -44,6 +49,13 @@ def main() -> None:
                     help="non-interactive Dev Tunnels host login command (headless auth)")
     ap.add_argument("--url-file", default=os.environ.get("CONTROL_PLANE_TUNNEL_URL_FILE"),
                     help="write the discovered public URL here (e.g. an AML outputs folder)")
+    ap.add_argument("--tunnel-anonymous", action=argparse.BooleanOptionalAction,
+                    default=os.environ.get("CONTROL_PLANE_TUNNEL_ANONYMOUS", "1") != "0",
+                    help="allow anonymous tunnel clients (default on). --no-tunnel-anonymous makes "
+                         "the tunnel non-anonymous; the relay then requires a connect token.")
+    ap.add_argument("--token-file", default=os.environ.get("CONTROL_PLANE_TUNNEL_TOKEN_FILE"),
+                    help="for a non-anonymous named tunnel: mint a connect token and write it here "
+                         "so the agent can set CONTROL_PLANE_TUNNEL_ACCESS_TOKEN (expires ~24h)")
     ap.add_argument("--devtunnel-cmd",
                     default=os.environ.get("CONTROL_PLANE_DEVTUNNEL_CMD", "devtunnel"))
     ap.add_argument("--persist", default=os.environ.get("CONTROL_PLANE_PERSIST"),
@@ -58,11 +70,17 @@ def main() -> None:
                     help="seconds to wait for the Dev Tunnel to publish a URL")
     args = ap.parse_args()
 
-    if not args.token:
+    if not args.token and args.tunnel_anonymous:
         raise SystemExit(
-            "refusing to publish an unauthenticated broker over a public Dev Tunnel; "
-            "set CONTROL_PLANE_TOKEN / --token."
+            "refusing to publish an unauthenticated broker over an anonymous public Dev Tunnel; "
+            "set CONTROL_PLANE_TOKEN / --token, or host a non-anonymous tunnel "
+            "(--no-tunnel-anonymous)."
         )
+
+    mint_token = bool(args.token_file and not args.tunnel_anonymous and args.tunnel_id)
+    if args.token_file and not mint_token:
+        print("[selfhost] WARN: --token-file requires --no-tunnel-anonymous and --tunnel-id; "
+              "no connect token will be minted.")
 
     store = ControlPlaneStore(persist_path=args.persist)
     app = create_app(store, token=args.token)
@@ -80,6 +98,16 @@ def main() -> None:
                 path.write_text(url + "\n", encoding="utf-8")
             except OSError as exc:
                 print(f"[selfhost] WARN: could not write url-file {args.url_file}: {exc}")
+        if mint_token:
+            try:
+                connect_token = issue_connect_token(args.tunnel_id, cmd=args.devtunnel_cmd)
+                path = Path(args.token_file)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(connect_token + "\n", encoding="utf-8")
+                print(f"[selfhost] wrote connect token to {args.token_file} (expires ~24h); "
+                      "set the agent's CONTROL_PLANE_TUNNEL_ACCESS_TOKEN to its contents.")
+            except (TunnelError, OSError) as exc:
+                print(f"[selfhost] WARN: could not mint/write connect token: {exc}")
         print(f"[selfhost] public Dev Tunnel URL (set the agent's CONTROL_PLANE_URL to this): {url}")
         ready.set()
 
@@ -91,6 +119,7 @@ def main() -> None:
                 args.port,
                 cmd=args.devtunnel_cmd,
                 tunnel_id=args.tunnel_id,
+                allow_anonymous=args.tunnel_anonymous,
                 login_cmd=login_cmd,
                 on_url=on_url,
             )

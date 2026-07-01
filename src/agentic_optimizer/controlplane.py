@@ -427,6 +427,23 @@ def create_app(
     return app
 
 
+def _client_headers(
+    token: str | None, tunnel_access_token: str | None = None
+) -> dict[str, str]:
+    """Assemble request headers for the two independent auth layers.
+
+    ``Authorization: Bearer`` is our application token (validated by the broker).
+    ``X-Tunnel-Authorization: tunnel`` is a Dev Tunnels *connect* token (validated by the relay,
+    only needed for a non-anonymous tunnel). Distinct headers means neither shadows the other.
+    """
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if tunnel_access_token:
+        headers["X-Tunnel-Authorization"] = f"tunnel {tunnel_access_token}"
+    return headers
+
+
 class ControlPlaneClient:
     """httpx-based client for the broker, shared by the MCP server and the training bridge."""
 
@@ -436,9 +453,22 @@ class ControlPlaneClient:
     # -- constructors -------------------------------------------------------
     @classmethod
     def from_url(
-        cls, base_url: str, token: str | None = None, timeout: float = 120.0
+        cls,
+        base_url: str,
+        token: str | None = None,
+        timeout: float = 120.0,
+        *,
+        tunnel_access_token: str | None = None,
     ) -> "ControlPlaneClient":
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        """Build a real networked client.
+
+        ``token`` is our application bearer token (``Authorization: Bearer``), validated by the
+        broker. ``tunnel_access_token`` is an independent Dev Tunnels *connect* token, sent as
+        ``X-Tunnel-Authorization: tunnel <token>`` so a **non-anonymous** tunnel relay admits the
+        request before it ever reaches the broker. The two headers are deliberately distinct so
+        they never clash — see :func:`agentic_optimizer.tunnel.issue_connect_token`.
+        """
+        headers = _client_headers(token, tunnel_access_token)
         return cls(httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout))
 
     @classmethod
@@ -455,11 +485,20 @@ class ControlPlaneClient:
 
         Returns ``None`` when ``CONTROL_PLANE_URL`` is unset, so callers (e.g. :func:`attach`) can
         run the *same* training script transparently with or without a control plane attached.
+
+        When the broker is fronted by a **non-anonymous** Dev Tunnel, also set
+        ``CONTROL_PLANE_TUNNEL_ACCESS_TOKEN`` to a connect token — it is forwarded as the
+        ``X-Tunnel-Authorization`` header so the relay admits the client.
         """
         url = os.environ.get("CONTROL_PLANE_URL")
         if not url:
             return None
-        return cls.from_url(url, token=os.environ.get("CONTROL_PLANE_TOKEN"), timeout=timeout)
+        return cls.from_url(
+            url,
+            token=os.environ.get("CONTROL_PLANE_TOKEN"),
+            timeout=timeout,
+            tunnel_access_token=os.environ.get("CONTROL_PLANE_TUNNEL_ACCESS_TOKEN"),
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -562,21 +601,29 @@ class ControlPlaneClient:
             return False
 
 
-def _check_exposure(*, token: str | None, tunnel: bool, host: str, insecure: bool) -> None:
+def _check_exposure(
+    *, token: str | None, tunnel: bool, host: str, insecure: bool, tunnel_anonymous: bool = True
+) -> None:
     """Refuse to expose an unauthenticated control plane.
 
     A Dev Tunnel is always a public endpoint and a non-loopback bind is reachable off-box;
     either one without a bearer token lets anyone drive the training run. Require
     ``CONTROL_PLANE_TOKEN`` in those cases unless the operator explicitly opts out with
-    ``CONTROL_PLANE_INSECURE=1``. Raises :class:`SystemExit` to abort startup."""
+    ``CONTROL_PLANE_INSECURE=1``. Raises :class:`SystemExit` to abort startup.
+
+    A **non-anonymous** tunnel (``tunnel_anonymous=False``) is itself an authentication layer —
+    the Dev Tunnels relay rejects clients that lack a connect token before requests reach us — so
+    it satisfies the check even without an application bearer token (defence in depth still
+    recommends setting both)."""
     if token or insecure:
         return
-    if tunnel:
+    if tunnel and tunnel_anonymous:
         raise SystemExit(
-            "Refusing to expose an unauthenticated control plane over a public Dev Tunnel. "
-            "Set CONTROL_PLANE_TOKEN (recommended) or CONTROL_PLANE_INSECURE=1 to override."
+            "Refusing to expose an unauthenticated control plane over an anonymous public Dev "
+            "Tunnel. Set CONTROL_PLANE_TOKEN (recommended), host a non-anonymous tunnel "
+            "(--no-tunnel-anonymous), or set CONTROL_PLANE_INSECURE=1 to override."
         )
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    if not tunnel and host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit(
             "Refusing to bind an unauthenticated control plane to a non-loopback host. "
             "Set CONTROL_PLANE_TOKEN or CONTROL_PLANE_INSECURE=1 to override."
@@ -618,6 +665,24 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
         "discover it (e.g. an AML outputs folder). Defaults to $CONTROL_PLANE_TUNNEL_URL_FILE. "
         "Requires --tunnel.",
     )
+    parser.add_argument(
+        "--tunnel-anonymous",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("CONTROL_PLANE_TUNNEL_ANONYMOUS", "1") != "0",
+        help="Whether the Dev Tunnel allows anonymous client access (default: on, for backward "
+        "compatibility). Pass --no-tunnel-anonymous (or CONTROL_PLANE_TUNNEL_ANONYMOUS=0) to make "
+        "the tunnel NON-ANONYMOUS: the Dev Tunnels relay then rejects clients that do not present a "
+        "connect token, before requests ever reach the broker. Clients supply that token via "
+        "CONTROL_PLANE_TUNNEL_ACCESS_TOKEN (sent as the X-Tunnel-Authorization header).",
+    )
+    parser.add_argument(
+        "--tunnel-token-file",
+        default=os.environ.get("CONTROL_PLANE_TUNNEL_TOKEN_FILE"),
+        help="For a NON-ANONYMOUS named tunnel: mint a Dev Tunnels connect token and write it here "
+        "so a remote agent can pick it up (set its CONTROL_PLANE_TUNNEL_ACCESS_TOKEN). Requires "
+        "--no-tunnel-anonymous and --tunnel-id. NOTE: connect tokens expire after ~24h. Defaults to "
+        "$CONTROL_PLANE_TUNNEL_TOKEN_FILE.",
+    )
     args = parser.parse_args()
 
     host = args.host
@@ -628,6 +693,7 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
         tunnel=args.tunnel,
         host=host,
         insecure=os.environ.get("CONTROL_PLANE_INSECURE") == "1",
+        tunnel_anonymous=args.tunnel_anonymous,
     )
     if args.tunnel_id and not args.tunnel:
         logger.warning(
@@ -637,6 +703,11 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
     if (args.tunnel_login or args.tunnel_url_file) and not args.tunnel:
         logger.warning(
             "--tunnel-login/--tunnel-url-file are ignored without --tunnel."
+        )
+    if args.tunnel_token_file and (args.tunnel_anonymous or not args.tunnel_id or not args.tunnel):
+        logger.warning(
+            "--tunnel-token-file requires --tunnel, --no-tunnel-anonymous and --tunnel-id; "
+            "no connect token will be minted."
         )
     persist_path = os.environ.get("CONTROL_PLANE_PERSIST")
     max_body_bytes = int(os.environ.get("CONTROL_PLANE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
@@ -648,15 +719,23 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
 
         tunnel_host = "127.0.0.1"
         logger.info(
-            "control plane on http://%s:%s via Dev Tunnel (auth: %s)",
+            "control plane on http://%s:%s via Dev Tunnel (bearer auth: %s, relay access: %s)",
             tunnel_host,
             port,
             "on" if token else "off",
+            "anonymous" if args.tunnel_anonymous else "non-anonymous (connect token required)",
         )
         logger.info(
             "Use the Dev Tunnel public URL as CONTROL_PLANE_URL on the remote node; "
             "the bearer token is still required when configured."
         )
+        if not args.tunnel_anonymous:
+            logger.info(
+                "Non-anonymous tunnel: clients must present a connect token via "
+                "CONTROL_PLANE_TUNNEL_ACCESS_TOKEN (X-Tunnel-Authorization header). Mint one with "
+                "`devtunnel token %s --scopes connect` (expires ~24h).",
+                args.tunnel_id or "<tunnel-id>",
+            )
         if args.tunnel_id:
             logger.info(
                 "Persistent Dev Tunnel '%s': its public URL is stable across restarts, so the "
@@ -671,17 +750,34 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
 
         login_cmd = shlex.split(args.tunnel_login) if args.tunnel_login else None
         url_file = args.tunnel_url_file
+        mint_token = bool(
+            args.tunnel_token_file and not args.tunnel_anonymous and args.tunnel_id
+        )
+        token_file = args.tunnel_token_file if mint_token else None
 
         def _on_url(url: str) -> None:
-            if not url_file:
-                return
-            try:
-                path = Path(url_file)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(url + "\n", encoding="utf-8")
-                logger.info("Wrote Dev Tunnel public URL to %s", url_file)
-            except OSError:
-                logger.warning("Failed to write Dev Tunnel URL to %s", url_file, exc_info=True)
+            if url_file:
+                try:
+                    path = Path(url_file)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(url + "\n", encoding="utf-8")
+                    logger.info("Wrote Dev Tunnel public URL to %s", url_file)
+                except OSError:
+                    logger.warning("Failed to write Dev Tunnel URL to %s", url_file, exc_info=True)
+            if token_file:
+                from .tunnel import TunnelError, issue_connect_token
+
+                try:
+                    connect_token = issue_connect_token(args.tunnel_id, cmd=args.devtunnel_cmd)
+                    path = Path(token_file)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(connect_token + "\n", encoding="utf-8")
+                    logger.info("Wrote Dev Tunnel connect token to %s (expires ~24h)", token_file)
+                except (TunnelError, OSError):
+                    logger.warning(
+                        "Failed to mint/write Dev Tunnel connect token to %s", token_file,
+                        exc_info=True,
+                    )
 
         serve_with_tunnel(
             app,
@@ -689,6 +785,7 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
             port,
             cmd=args.devtunnel_cmd,
             tunnel_id=args.tunnel_id,
+            allow_anonymous=args.tunnel_anonymous,
             login_cmd=login_cmd,
             on_url=_on_url,
         )

@@ -13,6 +13,8 @@ from agentic_optimizer.tunnel import (
     build_named_host_command,
     devtunnel_available,
     ensure_named_tunnel,
+    issue_connect_token,
+    parse_connect_token,
     parse_tunnel_url,
     run_login,
 )
@@ -359,3 +361,73 @@ def test_start_checks_real_popen_availability_before_spawning(
 
     with pytest.raises(TunnelError, match="Install it from"):
         DevTunnel(8765).start()
+
+
+# ------------------------------------------------------------------ non-anonymous / connect token
+
+
+def test_ensure_named_tunnel_non_anonymous_omits_flag() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    ensure_named_tunnel("stable-id", 8765, allow_anonymous=False, run=run)
+
+    assert calls == [
+        ["devtunnel", "create", "stable-id"],
+        ["devtunnel", "port", "create", "stable-id", "-p", "8765"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Tunnel access token: eyJhbGci.eyJzdWIi.abc-DEF_1", "eyJhbGci.eyJzdWIi.abc-DEF_1"),
+        ("eyJa.eyJb.c1\n", "eyJa.eyJb.c1"),
+        ("no token here", None),
+        ("", None),
+    ],
+)
+def test_parse_connect_token(output: str, expected: str | None) -> None:
+    assert parse_connect_token(output) == expected
+
+
+def test_issue_connect_token_success() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="Tunnel access token: eyJa.eyJb.sig_9", stderr=""
+        )
+
+    token = issue_connect_token("my-tid", run=run)
+
+    assert token == "eyJa.eyJb.sig_9"
+    assert calls == [["devtunnel", "token", "my-tid", "--scopes", "connect"]]
+
+
+def test_issue_connect_token_raises_on_nonzero_return() -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not authorized")
+
+    with pytest.raises(TunnelError, match="not authorized"):
+        issue_connect_token("my-tid", run=run)
+
+
+def test_issue_connect_token_raises_when_unparseable() -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="issued, but no jwt printed", stderr="")
+
+    with pytest.raises(TunnelError, match="could not parse a connect token"):
+        issue_connect_token("my-tid", run=run)
+
+
+def test_issue_connect_token_raises_on_oserror() -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("devtunnel missing")
+
+    with pytest.raises(TunnelError, match="failed to start"):
+        issue_connect_token("my-tid", run=run)

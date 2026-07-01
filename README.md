@@ -297,6 +297,35 @@ side:
   / `CONTROL_PLANE_TUNNEL_URL_FILE`; with a persistent `--tunnel-id` the URL is deterministic, so the agent's MCP
   config stays static.
 
+### Non-anonymous tunnels (relay-level access control)
+
+By default a Dev Tunnel allows **anonymous** clients, so the broker's bearer token is the *only* gate — anyone who
+learns the URL still hits FastAPI (and is rejected there without a token). Add `--no-tunnel-anonymous` (or
+`CONTROL_PLANE_TUNNEL_ANONYMOUS=0`) to make the tunnel **non-anonymous**: the Dev Tunnels relay then rejects
+unauthenticated clients *before* the request ever reaches the broker. This layers on top of — it does not replace —
+the bearer token. With a non-anonymous tunnel the broker no longer forces `CONTROL_PLANE_TOKEN` (the relay already
+authenticates callers), though setting both is the defence-in-depth default.
+
+Clients (both the bridge and the agent) authenticate to the relay with a **connect token**, sent as a
+`X-Tunnel-Authorization: tunnel <token>` header (deliberately separate from the app's `Authorization: Bearer`, so
+the two never clash). Configure it with **`CONTROL_PLANE_TUNNEL_ACCESS_TOKEN`** — `ControlPlaneClient.from_env`,
+`attach()`, and the MCP server all pick it up automatically. Mint one from an identity with *manage* scope over the
+tunnel:
+
+```bash
+devtunnel token my-stable-id --scopes connect      # prints the connect token (JWT)
+```
+
+In node-hosted mode the node can mint and publish the token for you: pass `--token-file`
+(`CONTROL_PLANE_TUNNEL_TOKEN_FILE`) alongside `--no-tunnel-anonymous` and a named `--tunnel-id`, and it writes the
+connect token next to the URL file for the agent to read.
+
+> ⚠️ **Connect tokens expire after ~24 hours** and can only be refreshed by a real user identity holding *manage*
+> scope. For runs longer than a day, either re-issue the token periodically, or grant access to an **Entra tenant**
+> (`devtunnel access create <id> --tenant`) / **GitHub org** (`--organization`) so members connect with their own
+> identity (typically via a `devtunnel connect` port-forward) and no shared token expires. The token path is
+> simplest for runs under a day or when you can refresh.
+
 ## Containers
 
 See [`docker/`](docker/) for separate broker and training-node images. The old single “Copilot CLI on the node”

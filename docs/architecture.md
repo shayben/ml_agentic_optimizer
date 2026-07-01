@@ -164,6 +164,28 @@ The broker, tunnel, and bridge are transport-symmetric, so the broker can run on
 The broker stores telemetry and small command/result payloads, not model weights. Custom interrogation handlers
 decide what data/model details are exposed; keep results free of sensitive raw data.
 
+### Non-anonymous tunnels (two independent auth layers)
+
+Tunnel access control and application auth are **separate layers**:
+
+1. **Relay layer (Dev Tunnels).** A tunnel is *anonymous* by default (any client may connect; the broker's token
+   is the only real gate). `--no-tunnel-anonymous` / `CONTROL_PLANE_TUNNEL_ANONYMOUS=0` (threaded through as
+   `allow_anonymous=False` in `tunnel.build_*` / `ensure_named_tunnel`) makes it *non-anonymous*: the relay rejects
+   clients lacking a **connect token** before requests reach FastAPI. `_check_exposure` treats a non-anonymous
+   tunnel as an auth layer, so it no longer forces `CONTROL_PLANE_TOKEN` (defence-in-depth still recommends both).
+2. **App layer (broker).** The `CONTROL_PLANE_TOKEN` bearer, validated by FastAPI with a constant-time compare.
+
+Clients present the connect token as `X-Tunnel-Authorization: tunnel <token>` — a header deliberately distinct from
+`Authorization: Bearer` so the two never collide. `ControlPlaneClient` assembles both via `_client_headers`;
+`from_env` (and therefore `attach()`, the bridge, and the MCP server) reads
+`CONTROL_PLANE_TUNNEL_ACCESS_TOKEN`. `tunnel.issue_connect_token(id)` shells out to
+`devtunnel token <id> --scopes connect` and parses the JWT; in node-hosted mode `--token-file`
+(`CONTROL_PLANE_TUNNEL_TOKEN_FILE`) mints and publishes it alongside the URL file.
+
+> Connect tokens **expire after ~24h** and refresh needs a *manage*-scoped user identity. For runs beyond a day,
+> re-issue periodically, or grant tenant/org access (`devtunnel access create <id> --tenant|--organization`) so
+> members connect with their own identity (via a `devtunnel connect` port-forward) and no shared token expires.
+
 ## Secondary mode: agent-on-node file contract
 
 `agentic_optimizer.callback.AgenticCallback` + `driver.CopilotOptimizerDriver` retain the earlier `state.json` /

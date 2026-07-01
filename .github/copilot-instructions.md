@@ -118,16 +118,22 @@ entry point — see the conventions below.
 
 ## Env vars
 
-- Local + node clients: `CONTROL_PLANE_URL`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_RUN_ID`.
+- Local + node clients: `CONTROL_PLANE_URL`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_RUN_ID`,
+  `CONTROL_PLANE_TUNNEL_ACCESS_TOKEN` (Dev Tunnels *connect* token for a non-anonymous tunnel; forwarded as the
+  `X-Tunnel-Authorization: tunnel <token>` header by `ControlPlaneClient.from_env`/`from_url`, independent of the
+  bearer token).
 - Broker: `CONTROL_PLANE_HOST`, `CONTROL_PLANE_PORT`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_PERSIST`,
   `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1`, `CONTROL_PLANE_TUNNEL_ID` (persistent named Dev
   Tunnel → stable public URL for `--tunnel`, so the node/MCP config stays static across restarts),
   `CONTROL_PLANE_TUNNEL_LOGIN` (non-interactive Dev Tunnels host login for node-hosted mode; anonymous access is
-  client-only so a headless host must authenticate) and `CONTROL_PLANE_TUNNEL_URL_FILE` (write the discovered
-  public URL for cross-machine discovery). Broker startup (`controlplane._check_exposure`)
-  **refuses** to serve an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind
-  (anyone reachable could drive the run); set `CONTROL_PLANE_TOKEN`, or `CONTROL_PLANE_INSECURE=1` to override
-  (unsafe). A loopback bind with no token is allowed.
+  client-only so a headless host must authenticate), `CONTROL_PLANE_TUNNEL_URL_FILE` (write the discovered
+  public URL for cross-machine discovery), `CONTROL_PLANE_TUNNEL_ANONYMOUS=0` / `--no-tunnel-anonymous` (make the
+  relay reject unauthenticated clients; then no bearer token is forced) and `CONTROL_PLANE_TUNNEL_TOKEN_FILE`
+  (node-hosted: mint a connect token via `tunnel.issue_connect_token` and write it beside the URL file — needs a
+  non-anonymous named tunnel; connect tokens expire ~24h). Broker startup (`controlplane._check_exposure`)
+  **refuses** to serve an unauthenticated control plane over an *anonymous* public `--tunnel` **or** a non-loopback
+  bind (anyone reachable could drive the run); set `CONTROL_PLANE_TOKEN`, host a non-anonymous tunnel, or
+  `CONTROL_PLANE_INSECURE=1` to override (unsafe). A loopback bind with no token is allowed.
 
 ## Where things live
 
