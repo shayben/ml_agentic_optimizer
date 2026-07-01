@@ -131,6 +131,26 @@ def test_ensure_named_tunnel_creates_tunnel_and_port_tolerating_existing() -> No
     ]
 
 
+def test_ensure_named_tunnel_tolerates_conflict_with_existing_entity() -> None:
+    # The Dev Tunnels service reports a pre-existing named tunnel as "Conflict with existing entity"
+    # (not "already exists"); ensure_named_tunnel must treat it as success so broker restarts are
+    # idempotent rather than crashing on the create step.
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="Tunnel service error: Conflict with existing entity."
+        )
+
+    ensure_named_tunnel("stable-id", 8765, run=run)
+
+    assert calls == [
+        ["devtunnel", "create", "stable-id", "--allow-anonymous"],
+        ["devtunnel", "port", "create", "stable-id", "-p", "8765"],
+    ]
+
+
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
@@ -151,6 +171,27 @@ def test_ensure_named_tunnel_creates_tunnel_and_port_tolerating_existing() -> No
 )
 def test_parse_tunnel_url(line: str, expected: str | None) -> None:
     assert parse_tunnel_url(line) == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "port", "expected"),
+    [
+        # the connect URL for the hosted port matches
+        (
+            "Connect via browser: https://tq0b9bb5-8770.usw2.devtunnels.ms",
+            8770,
+            "https://tq0b9bb5-8770.usw2.devtunnels.ms",
+        ),
+        # a different (e.g. stale) port is rejected
+        ("Connect via browser: https://tq0b9bb5-8765.usw2.devtunnels.ms", 8770, None),
+        # the per-port inspect URL never matches -<port>
+        ("Inspect: https://tq0b9bb5-8770-inspect.usw2.devtunnels.ms", 8770, None),
+        # a portless named-tunnel URL is rejected when a port is required (caller falls back)
+        ("Connect via browser: https://stable-id.devtunnels.ms", 8770, None),
+    ],
+)
+def test_parse_tunnel_url_port_filter(line: str, port: int, expected: str | None) -> None:
+    assert parse_tunnel_url(line, port=port) == expected
 
 
 def test_devtunnel_available(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,6 +246,35 @@ def test_dev_tunnel_named_start_ensures_then_hosts_stable_url() -> None:
         ("run", ["devtunnel", "port", "create", "stable-id", "-p", "8765"]),
         ("popen", ["devtunnel", "host", "stable-id", "--allow-anonymous"]),
     ]
+
+
+def test_dev_tunnel_named_start_selects_hosted_port_not_first_listed() -> None:
+    # Regression: a named tunnel may forward several ports (e.g. a stale one from a prior run).
+    # devtunnel host then prints a connect URL per port; start() must return the URL for the port
+    # we actually host (8770), not the first-listed (stale 8765) one, and must ignore inspect URLs.
+    fake_proc = FakeProcess(
+        FakeStdout(
+            [
+                "Hosting port: 8765\n",
+                "Connect via browser: https://tq0b9bb5-8765.usw2.devtunnels.ms\n",
+                "Inspect network activity: https://tq0b9bb5-8765-inspect.usw2.devtunnels.ms\n",
+                "Hosting port: 8770\n",
+                "Connect via browser: https://tq0b9bb5-8770.usw2.devtunnels.ms\n",
+                "Inspect network activity: https://tq0b9bb5-8770-inspect.usw2.devtunnels.ms\n",
+                "Ready to accept connections for tunnel: wcs-agentic.usw2\n",
+            ]
+        )
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        return fake_proc
+
+    dev_tunnel = DevTunnel(8770, tunnel_id="wcs-agentic", popen=popen, run=run, timeout=1)
+
+    assert dev_tunnel.start() == "https://tq0b9bb5-8770.usw2.devtunnels.ms"
 
 
 def test_run_login_runs_command() -> None:

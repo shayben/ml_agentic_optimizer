@@ -489,10 +489,21 @@ class ControlPlaneClient:
         When the broker is fronted by a **non-anonymous** Dev Tunnel, also set
         ``CONTROL_PLANE_TUNNEL_ACCESS_TOKEN`` to a connect token — it is forwarded as the
         ``X-Tunnel-Authorization`` header so the relay admits the client.
+
+        ``CONTROL_PLANE_TIMEOUT`` (seconds) overrides the httpx timeout. On a training *node* set it
+        low (e.g. 10) so a black-holing tunnel relay cannot stall the training thread on the
+        synchronous telemetry push; the node only short-polls (``wait=0``) so a low timeout is safe.
+        Leave it unset for interactive/long-poll callers that need the 120 s default.
         """
         url = os.environ.get("CONTROL_PLANE_URL")
         if not url:
             return None
+        env_timeout = os.environ.get("CONTROL_PLANE_TIMEOUT")
+        if env_timeout:
+            try:
+                timeout = float(env_timeout)
+            except ValueError:
+                logger.warning("ignoring non-numeric CONTROL_PLANE_TIMEOUT=%r", env_timeout)
         return cls.from_url(
             url,
             token=os.environ.get("CONTROL_PLANE_TOKEN"),

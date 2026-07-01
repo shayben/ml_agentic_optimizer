@@ -71,8 +71,13 @@ def ensure_named_tunnel(
 
 
 def _already_exists(result: subprocess.CompletedProcess[str]) -> bool:
-    output = f"{result.stderr or ''}\n{result.stdout or ''}"
-    return result.returncode != 0 and "already exists" in output.lower()
+    output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    if result.returncode == 0:
+        return False
+    # The Dev Tunnels service reports a pre-existing named tunnel/port either as "... already exists"
+    # or as "Conflict with existing entity" depending on the operation; both mean the entity is there,
+    # so ensure_named_tunnel can treat them as success (it is meant to be idempotent).
+    return "already exists" in output or "conflict with existing entity" in output
 
 
 def run_login(
@@ -152,12 +157,24 @@ def issue_connect_token(
     return token
 
 
-def parse_tunnel_url(line: str) -> str | None:
-    """Extract the first public ``https://*.devtunnels.ms`` URL from a devtunnel line."""
+def parse_tunnel_url(line: str, port: int | None = None) -> str | None:
+    """Extract a public ``https://*.devtunnels.ms`` URL from a devtunnel line.
+
+    When ``port`` is given, only return a URL whose host label encodes that forwarded port
+    (``https://<id>-<port>.<cluster>.devtunnels.ms``). A named tunnel can forward several ports, and
+    ``devtunnel host`` then prints one connect URL per port; without this filter the first-listed
+    (often a stale, lower-numbered) port would be returned instead of the port we actually host. The
+    per-port *inspect* URL (``<id>-<port>-inspect...``) never matches ``-<port>`` and is rejected.
+    """
     match = _DEV_TUNNEL_URL_RE.search(line)
     if match is None:
         return None
-    return match.group(0).rstrip(" \t\r\n.,);]")
+    url = match.group(0).rstrip(" \t\r\n.,);]")
+    if port is not None:
+        host_label = url.split("://", 1)[-1].split("/", 1)[0].split(".", 1)[0]
+        if host_label.rsplit("-", 1)[-1] != str(port):
+            return None
+    return url
 
 
 class DevTunnel:
@@ -243,27 +260,61 @@ class DevTunnel:
 
         captured: list[str] = []
         deadline = time.monotonic() + self.timeout
+        # A named tunnel may forward several ports (e.g. a stale one left over from a prior run);
+        # devtunnel host then prints a connect URL per port, so require the URL for the port we host
+        # rather than blindly taking the first. Keep first-match behaviour for ad-hoc tunnels.
+        want_port = self.port if self.tunnel_id is not None else None
+        seen: list[str] = []  # distinct non-inspect URLs, for an unambiguous single-URL fallback
+
+        def _accept(u: str) -> str:
+            self.url = u
+            self._startup_done.set()
+            self._emit_url(u)
+            return u
+
+        def _fallback() -> str | None:
+            # Fall back only when exactly one URL was advertised (e.g. a named tunnel that does not
+            # port-tag its connect URL). With several ports advertised and none matching the port we
+            # host, refuse to guess -- returning the wrong port would send the node to a dead relay.
+            uniq = list(dict.fromkeys(seen))
+            return uniq[0] if len(uniq) == 1 else None
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                fb = _fallback()
+                if fb is not None:
+                    return _accept(fb)
                 self.stop()
                 raise TunnelError(self._format_start_failure("Timed out", captured))
             try:
                 line = lines.get(timeout=min(0.1, remaining))
             except queue.Empty:
                 if self.proc is not None and self.proc.poll() is not None:
+                    fb = _fallback()
+                    if fb is not None:
+                        return _accept(fb)
                     raise TunnelError(self._format_start_failure("Process exited", captured))
                 continue
 
             if line is None:
+                fb = _fallback()
+                if fb is not None:
+                    return _accept(fb)
                 raise TunnelError(self._format_start_failure("Process exited", captured))
             captured.append(line.rstrip())
-            url = parse_tunnel_url(line)
+            url = parse_tunnel_url(line, port=want_port)
             if url is not None:
-                self.url = url
-                self._startup_done.set()
-                self._emit_url(url)
-                return url
+                return _accept(url)
+            # Track any non-inspect URL for the unambiguous fallback, and take it as soon as the host
+            # signals readiness (so we don't wait out the whole timeout on a portless single-port URL).
+            any_url = parse_tunnel_url(line)
+            if any_url is not None and "-inspect." not in any_url:
+                seen.append(any_url)
+            if "ready to accept connections" in line.lower():
+                fb = _fallback()
+                if fb is not None:
+                    return _accept(fb)
 
     def stop(self) -> None:
         """Terminate the tunnel subprocess if it is still running."""

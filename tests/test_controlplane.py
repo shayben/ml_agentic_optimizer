@@ -225,6 +225,24 @@ def test_from_env_reads_tunnel_access_token(monkeypatch):
     assert c._client.headers["x-tunnel-authorization"] == "tunnel ct"
 
 
+def test_from_env_honors_timeout_override(monkeypatch):
+    # A low node-side timeout bounds how long a black-holing tunnel relay can stall the training
+    # thread on the synchronous telemetry push.
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://x")
+    monkeypatch.setenv("CONTROL_PLANE_TIMEOUT", "10")
+    c = ControlPlaneClient.from_env()
+    assert c is not None
+    assert c._client.timeout.read == 10.0
+
+
+def test_from_env_ignores_non_numeric_timeout(monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://x")
+    monkeypatch.setenv("CONTROL_PLANE_TIMEOUT", "not-a-number")
+    c = ControlPlaneClient.from_env()  # falls back to the default instead of raising
+    assert c is not None
+    assert c._client.timeout.read == 120.0
+
+
 def test_max_body_413():
     c = _client(token="secret", max_body_bytes=10)
     response = c._client.post(
