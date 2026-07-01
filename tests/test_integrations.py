@@ -25,7 +25,6 @@ class FakeBridge:
         self.epoch_end: list[dict] = []
         self.train_begin = False
         self.train_end = False
-        self.paused = False
         self._stop = False
 
     def on_train_begin(self) -> None:

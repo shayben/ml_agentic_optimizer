@@ -35,7 +35,11 @@ Read `docs/architecture.md` for the full picture. The shape:
 - **BROKER** — `agentic_optimizer.controlplane`, the only network-reachable component. FastAPI + bearer token,
   in-memory by default, optional SQLite (`CONTROL_PLANE_PERSIST`). Console script `agentic-optimizer-broker`.
 - **NODE** — your PyTorch loop + `agentic_optimizer.bridge.TrainingBridge`, which pushes telemetry and applies
-  agent commands at safe sync points.
+  agent commands at safe sync points. **Never-idle invariant:** the bridge must *never block or pause the training
+  loop*. Telemetry pushes are fire-and-forget and command draining is non-blocking, so the agent always reads
+  slightly stale state and its influence lands **with delay** at the next sync point. Do not add any command,
+  handler, or wait that idles the loop waiting on the agent; `stop_training` (a polled flag) is the only allowed
+  loop-halting control, and it terminates rather than idles.
 
 `agentic_optimizer.contract` holds the shared pydantic models and is the **single source of truth** — change it
 first, then the broker/bridge/MCP sides. Command lifecycle: agent enqueues via an MCP tool → broker per-`run_id`
@@ -66,7 +70,7 @@ entry point — see the conventions below.
   wrapped by a thin `@mcp.tool()` in `build_server`. Impls are decorated with `_safe_impl`, so they return
   `{"error": ..., "available": False}` instead of raising. Tests and `examples/agent_sim.py` drive the `*_impl`
   functions directly — add new tools the same way.
-- **Bridge command safety classes.** `_is_safe_async` decides execution: `pause`/`resume`/`flag_samples`/
+- **Bridge command safety classes.** `_is_safe_async` decides execution: `flag_samples`/
   `stop_training`/`extend_training`/`set_guardrails` and any interrogation/action registered via
   `bridge.register(name, fn, safe_async=True)` run **immediately** in the background poller thread and **must be
   read-only / non-torch-mutating**; everything that mutates the loop or torch state (`set_hyperparameters`,

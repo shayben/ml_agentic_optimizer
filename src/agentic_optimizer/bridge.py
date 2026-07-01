@@ -1,13 +1,17 @@
 """``TrainingBridge`` — the remote-side glue that connects a live PyTorch loop to the control plane.
 
-The bridge is what makes a run *interactive* for a local agent:
+The bridge is what makes a run *interactive* for a local agent — **without ever pausing or idling it**:
 
 * it **pushes telemetry** (training state + optional **MLflow** linkage) to the broker;
 * it **claims commands** the agent enqueued and runs them through a :class:`HandlerRegistry` at **safe sync
   points** (epoch/batch boundaries), then **posts results** back;
-* built-in handlers cover hyperparameters, pause/resume, augmentation, sample-flagging and evaluation, while a
+* built-in handlers cover hyperparameters, augmentation, sample-flagging and evaluation, while a
   registry lets users expose **any** loop influence point (preprocessing, filtering, balancing, interrogations,
   custom knobs) — the agent reaches them generically via ``invoke`` / ``interrogate`` / ``set_knob``.
+
+The training loop is **never blocked**: telemetry is fire-and-forget and command draining is non-blocking, so the
+agent always observes *slightly stale* state and its influence lands **asynchronously** at the next sync point
+(never a barrier that idles the GPU). A graceful ``stop_training`` sets a flag the loop polls; it does not idle.
 
 ``torch`` is only needed for the optional grad-clip helper; the bridge itself imports it lazily.
 """
@@ -130,17 +134,14 @@ class TrainingBridge:
         mlflow: bool = False,
         mlflow_info_provider: Callable[["TrainingBridge", dict[str, float]], MlflowInfo | None]
         | None = None,
-        pause_poll_s: float = 0.5,
         run_id: str = "default",
         susp_topk: int = 256,
         on_training_config: Callable[[TrainingConfig], None] | None = None,
         on_flagged_samples: Callable[[list[int]], None] | None = None,
         poll_interval: float = 0.0,
-        max_pause_s: float = 0.0,
         scheduler: Any = None,
         scaler: Any = None,
         on_scheduler_reconfig: Callable[[dict[str, Any]], Any] | None = None,
-        auto_pause_on_anomaly: bool = True,
         anomaly_detector: AnomalyDetector | None = None,
         guardrails: GuardrailConfig | dict[str, Any] | None = None,
         auto_grad_norm: bool = True,
@@ -156,17 +157,14 @@ class TrainingBridge:
         self.max_epochs = max_epochs
         self.mlflow_enabled = mlflow
         self._mlflow_info_provider = mlflow_info_provider
-        self.pause_poll_s = pause_poll_s
         self.run_id = run_id
         self.susp_topk = max(0, int(susp_topk))
         self.on_training_config = on_training_config
         self.on_flagged_samples = on_flagged_samples
         self.poll_interval = float(poll_interval)
-        self.max_pause_s = float(max_pause_s)
         self.scheduler = scheduler
         self.scaler = scaler
         self.on_scheduler_reconfig = on_scheduler_reconfig
-        self.auto_pause_on_anomaly = bool(auto_pause_on_anomaly)
         self.auto_grad_norm = bool(auto_grad_norm)
         self._anomaly = anomaly_detector or AnomalyDetector()
         self._guardrails = _as_guardrails(guardrails)
@@ -185,7 +183,6 @@ class TrainingBridge:
         self.loss_history: list[float] = []
         self.grad_norm: float | None = None
         self.grad_clip: float | None = None
-        self.paused = False
         self.augmentation_enabled: bool | None = None
         self.flagged_indices: set[int] = set()
         self.knob_values: dict[str, Any] = {}
@@ -214,8 +211,6 @@ class TrainingBridge:
     # ------------------------------------------------------------- handlers
     def _register_builtins(self) -> None:
         self.registry.register("set_hyperparameters", self._h_set_hyperparameters)
-        self.registry.register("pause", self._h_pause)
-        self.registry.register("resume", self._h_resume)
         self.registry.register("set_augmentation", self._h_set_augmentation)
         self.registry.register("flag_samples", self._h_flag_samples)
         self.registry.register("run_evaluation", self._h_run_evaluation)
@@ -275,14 +270,6 @@ class TrainingBridge:
                     "reason": res.reason,
                 }
         return out, notes
-
-    def _h_pause(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
-        self.paused = True
-        return {"paused": True}
-
-    def _h_resume(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
-        self.paused = False
-        return {"paused": False}
 
     def _h_set_augmentation(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
         enabled = bool(args.get("enabled", True))
@@ -580,50 +567,11 @@ class TrainingBridge:
     def on_epoch_end(self, epoch: int, metrics: dict[str, float] | None = None) -> list[Command]:
         self.epoch = epoch
         self.push_telemetry(metrics or {})
-        processed = self.drain_commands()
-        # Honour a live pause: keep serving commands until the agent resumes. The pause
-        # decision is synchronized across ranks each iteration (see _sync_paused) so every
-        # rank issues the same collectives and the process group never deadlocks on a
-        # one-sided pause; rank 0 owns the broker connection and max_pause_s auto-resume.
-        pause_started = time.monotonic()
-        broker_errors = 0
-        while self._sync_paused():
-            before_error_serial = self._error_serial
-            self.push_telemetry({})
-            processed += self.drain_commands()
-            if self._error_serial > before_error_serial:
-                broker_errors += self._error_serial - before_error_serial
-                if broker_errors >= 3:
-                    logger.error("broker errors during pause; waiting for resume may be blocked")
-            else:
-                broker_errors = 0
-            # Only rank 0 (or a single process) decides the auto-resume timeout; clearing
-            # self.paused here is propagated to every rank by the next _sync_paused() so
-            # they all leave the loop together rather than one rank breaking early.
-            if (
-                (not dist.is_available() or dist.is_main_process())
-                and self.max_pause_s > 0
-                and time.monotonic() - pause_started > self.max_pause_s
-            ):
-                logger.warning("auto-resume after max_pause_s=%s", self.max_pause_s)
-                self.paused = False
-            if self.paused:
-                time.sleep(self.pause_poll_s)
-        return processed
-
-    def _sync_paused(self) -> bool:
-        """Resolve one pause decision shared by every rank for this loop iteration.
-
-        ``pause``/``resume`` are non-replicated (rank-0-only) commands, so in distributed
-        mode the other ranks never see them directly. Rank 0 owns the pause state (broker
-        connection + ``max_pause_s`` auto-resume) and broadcasts it here; every rank loops
-        the same number of times and issues matched collective calls. Without this a
-        one-sided pause desyncs the ranks and deadlocks the process group on the next
-        broadcast. In single-process mode this is just ``self.paused``."""
-        if not dist.is_available():
-            return self.paused
-        self.paused = bool(dist.broadcast_object(bool(self.paused), src=0))
-        return self.paused
+        # Non-blocking by design: push the latest telemetry and apply whatever commands the agent
+        # has already enqueued, then return immediately so the loop keeps training. The agent's
+        # influence is therefore always *asynchronous* — it acts on slightly stale telemetry and
+        # its next command lands here one or more epochs later. The loop never idles waiting for it.
+        return self.drain_commands()
 
     def on_train_end(self) -> None:
         if self._poll_thread is not None:
@@ -683,7 +631,6 @@ class TrainingBridge:
             run_id=self.run_id,
             state=state,
             mlflow=self._mlflow_info(metrics),
-            paused=self.paused,
             knobs=list(self.knobs.values()),
             last_error=self.last_error,
             checkpoints=list(self._checkpoints.values()),
@@ -800,8 +747,6 @@ class TrainingBridge:
 
     def _is_safe_async(self, cmd: Command) -> bool:
         if cmd.type in {
-            "pause",
-            "resume",
             "flag_samples",
             "stop_training",
             "extend_training",
@@ -940,8 +885,6 @@ class TrainingBridge:
         self.last_error = f"anomaly: {event.message}"
         self._error_serial += 1
         logger.warning("training anomaly detected: %s", event.message)
-        if self.auto_pause_on_anomaly:
-            self.paused = True
 
     def _profile_summary(self, gpu: Any) -> ProfileSummary | None:
         summary = self.profiler.summary()
@@ -1040,8 +983,6 @@ _NON_REPLICATED = {
     "run_evaluation",
     "flag_samples",
     "save_checkpoint",
-    "pause",
-    "resume",
     "stop_training",
     "extend_training",
 }
@@ -1179,8 +1120,6 @@ class NoOpBridge:
     becoming agent-steerable only when a broker is present. ``should_stop()`` is always ``False``
     and :meth:`section` yields a null context.
     """
-
-    paused = False
 
     def __init__(
         self,

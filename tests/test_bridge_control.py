@@ -1,4 +1,4 @@
-"""Integration tests for the live-control features: checkpoints, anomaly auto-pause, guardrails,
+"""Integration tests for the live-control features: checkpoints, anomaly detection, guardrails,
 profiler/scheduler telemetry, run lifecycle (stop/extend), distributed gating, and the
 ``step``/``epoch_end``/``attach`` ergonomics layer."""
 from __future__ import annotations
@@ -181,19 +181,18 @@ def test_checkpoint_disk_roundtrip(tmp_path):
 
 
 # --------------------------------------------------------------- anomalies
-def test_anomaly_auto_pause_on_nan_loss():
+def test_anomaly_recorded_on_nan_loss():
     bridge, opt, client = make_bridge()
     bridge.on_batch_end(float("nan"), batch_size=4)
-    assert bridge.paused is True
+    # Anomalies are recorded and surfaced to the agent, but NEVER pause the loop.
     assert len(bridge._anomalies) == 1
     assert bridge._anomalies[0].kind == "nan_loss"
     assert bridge.last_error and "anomaly" in bridge.last_error
 
 
-def test_anomaly_not_paused_when_disabled_but_recorded_in_telemetry():
-    bridge, opt, client = make_bridge(auto_pause_on_anomaly=False)
+def test_anomaly_recorded_in_telemetry():
+    bridge, opt, client = make_bridge()
     bridge.on_batch_end(float("inf"), batch_size=4)
-    assert bridge.paused is False
     bridge.push_telemetry({})
     anomalies = client.get_telemetry().anomalies
     assert anomalies and anomalies[0].kind == "inf_loss"
@@ -201,9 +200,7 @@ def test_anomaly_not_paused_when_disabled_but_recorded_in_telemetry():
 
 def test_anomaly_grad_explosion_detected_after_warmup():
     detector = AnomalyDetector(warmup=2, grad_explosion_factor=2.0)
-    bridge, opt, client = make_bridge(
-        anomaly_detector=detector, auto_pause_on_anomaly=False, auto_grad_norm=False
-    )
+    bridge, opt, client = make_bridge(anomaly_detector=detector, auto_grad_norm=False)
     for _ in range(3):
         bridge.on_batch_end(0.5, grad_norm=1.0)
     bridge.on_batch_end(0.5, grad_norm=20.0)
@@ -441,7 +438,7 @@ def test_noop_bridge_control_surface_is_inert():
         b.register("x", lambda a, c: None)
         b.register_knob("k", lambda v: None)
         b.scheduler_step()
-    assert nb.paused is False
+    assert nb.should_stop() is False
 
 
 def test_noop_bridge_still_drives_training():
@@ -492,7 +489,7 @@ def test_non_finite_values_do_not_break_telemetry():
     """inf/nan in grad_norm, metrics, or per-sample losses must not blow up the JSON
     telemetry push (which would blind the agent during divergence, dropping the anomalies
     that ride the same payload)."""
-    bridge, opt, client = make_bridge(auto_pause_on_anomaly=False)
+    bridge, opt, client = make_bridge()
     bridge.on_batch_end(
         0.5,
         batch_size=4,
@@ -513,65 +510,6 @@ def test_non_finite_values_do_not_break_telemetry():
     # itself JSON-safe (its non-finite value is nulled rather than serialized).
     assert telem.anomalies
     assert telem.anomalies[0].value is None
-
-
-class _SyncDist:
-    """Fake distributed whose broadcast_object models rank-0-authoritative propagation:
-    the source rank returns what it sent, replicas receive rank 0's decision."""
-
-    def __init__(self, *, main: bool, rank0_decision: bool | None = None) -> None:
-        self.main = main
-        self.rank0_decision = rank0_decision
-        self.broadcasts: list = []
-
-    def is_available(self) -> bool:
-        return True
-
-    def is_main_process(self) -> bool:
-        return self.main
-
-    def broadcast_object(self, obj, src: int = 0):
-        self.broadcasts.append(obj)
-        return obj if self.main else self.rank0_decision
-
-    def info(self) -> dict:
-        return {"enabled": True, "rank": 0 if self.main else 1, "world_size": 2, "backend": "gloo"}
-
-
-def test_ddp_replica_adopts_rank0_resume(monkeypatch):
-    """A non-zero rank that locally auto-paused (e.g. a rank-local anomaly) must follow
-    rank 0's broadcast so an agent resume clears the whole group and every rank keeps
-    issuing the same collectives — otherwise the process group deadlocks."""
-    bridge, opt, client = make_bridge()
-    fake = _SyncDist(main=False, rank0_decision=False)
-    monkeypatch.setattr(bridge_module, "dist", fake)
-    bridge.paused = True
-    assert bridge._sync_paused() is False
-    assert bridge.paused is False
-    assert fake.broadcasts == [True]  # it still participated in the collective
-
-
-def test_ddp_replica_pauses_when_rank0_paused(monkeypatch):
-    """pause is non-replicated, so a replica never sees it directly; it still pauses
-    because rank 0 broadcasts the decision each iteration."""
-    bridge, opt, client = make_bridge()
-    fake = _SyncDist(main=False, rank0_decision=True)
-    monkeypatch.setattr(bridge_module, "dist", fake)
-    assert bridge.paused is False
-    assert bridge._sync_paused() is True
-    assert bridge.paused is True
-    assert fake.broadcasts == [False]
-
-
-def test_sync_paused_noop_in_single_process(monkeypatch):
-    """With no process group, _sync_paused is just the local flag (no collective)."""
-    bridge, opt, client = make_bridge()
-    fake = _SyncDist(main=True)
-    fake.is_available = lambda: False  # type: ignore[assignment]
-    monkeypatch.setattr(bridge_module, "dist", fake)
-    bridge.paused = True
-    assert bridge._sync_paused() is True
-    assert fake.broadcasts == []  # never broadcast
 
 
 def test_from_env_builds_bridge_when_configured(monkeypatch):

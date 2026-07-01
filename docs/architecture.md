@@ -44,7 +44,9 @@ agent (MCP tool)         broker                              bridge (training lo
 - An optional bridge background poller (`poll_interval`) improves prompt command pickup without mutating mid-step.
 - Broker command leases/redelivery prevent a crashed bridge from stranding commands.
 - Structured logging and `last_error` in telemetry help diagnose handler or transport failures.
-- `pause_training` / `resume_training` pause at the bridge with a max-pause safety timeout.
+- The training loop **never blocks or idles** waiting on the agent: telemetry is fire-and-forget and command
+  draining is non-blocking, so the agent reads slightly stale state and its influence lands **with delay** at the
+  next sync point. A graceful `stop_training` sets a flag the loop polls to exit — it does not idle.
 
 ## Influence points
 
@@ -57,7 +59,7 @@ Built-ins include:
 - `set_guardrails` to set per-knob min/max bounds and a max relative-change limit at runtime.
 - `get_profile` for a step-time breakdown; `get_scheduler` / `set_scheduler` to observe/reshape the LR schedule.
 - `get_anomalies` to read recorded NaN/Inf/grad-explosion events; `stop_training` / `extend_training` for lifecycle.
-- `run_evaluation`, `pause_training`, `resume_training`, `get_training_state`, `get_metrics`, `get_mlflow_info`,
+- `run_evaluation`, `get_training_state`, `get_metrics`, `get_mlflow_info`,
   and `wait_for_result`.
 
 The `HandlerRegistry` exposes custom loop logic:
@@ -77,9 +79,10 @@ Mutating a live run is risky, so the bridge de-risks the agent's actions:
   worse. The bridge keeps the last `max_checkpoints` and evicts in insertion order.
 - **Guardrails** — `_apply_guardrails` clamps requested `lr`/`weight_decay`/`momentum`/`grad_clip` to configured
   bounds and a max relative-change limit *before* applying, returning notes so the agent sees what was clamped.
-- **Anomaly auto-pause** — an `AnomalyDetector` watches each `on_batch_end` for NaN/Inf loss/grad and grad
-  explosion. Events are recorded (`get_anomalies`) and, when `auto_pause_on_anomaly=True`, pause the run. Non-finite
-  values are never serialized into telemetry (they are recorded as `null`) so JSON push cannot silently fail.
+- **Anomaly detection** — an `AnomalyDetector` watches each `on_batch_end` for NaN/Inf loss/grad and grad
+  explosion. Events are recorded and surfaced to the agent (`get_anomalies`, `last_error`) **without ever pausing
+  the run** — the loop keeps training and the agent reacts asynchronously. Non-finite values are never serialized
+  into telemetry (they are recorded as `null`) so JSON push cannot silently fail.
 
 ## Profiling, scheduler, lifecycle, and distributed
 
@@ -112,7 +115,7 @@ Mutating a live run is risky, so the bridge de-risks the agent's actions:
 ## Telemetry, MLflow, and multi-run
 
 Telemetry includes step/epoch, recent losses, optimizer param groups, gradient norm, throughput, GPU memory,
-optional GPU utilization (`gpu.util_pct` via `pynvml`), `last_error`, pause state, metrics, and optional MLflow
+optional GPU utilization (`gpu.util_pct` via `pynvml`), `last_error`, metrics, and optional MLflow
 run info. With `mlflow=True`, the bridge logs pushed metrics and surfaces run metadata to the agent.
 
 Multiple runs can share one broker. Each client sets `CONTROL_PLANE_RUN_ID`; the agent can call `list_runs` and

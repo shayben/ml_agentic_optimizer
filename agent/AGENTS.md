@@ -8,7 +8,7 @@ Select the right run with `select_run(run_id)` when needed.
 
 Observe:
 - `get_training_state()` — latest step/epoch, losses, optimizer settings, grad norm, throughput, GPU memory/util,
-  pause state, `last_error`, and MLflow linkage when present.
+  `last_error`, recorded anomalies, and MLflow linkage when present.
 - `get_metrics(limit)` — recent metric history.
 - `get_mlflow_info()` — MLflow run ID, tracking URI, experiment, and latest metrics.
 - `list_runs()` / `select_run(run_id)` — inspect and switch broker run namespaces.
@@ -23,7 +23,7 @@ Interject:
 - `invoke(action, args)` / `interrogate(name, args)` — queue custom loop actions or data/model queries.
 - `invoke_and_wait(...)` / `interrogate_and_wait(...)` — one-call queue + result collection.
 - `flag_samples(indices)` — drive the job's `on_flagged_samples` callback (for example down-weight noisy labels).
-- `run_evaluation(args)`, `pause_training()`, `resume_training()`, `wait_for_result(command_id)`.
+- `run_evaluation(args)`, `wait_for_result(command_id)`.
 
 Optional HPO tools (only with `[hpo]`): `hpo_configure`, `hpo_suggest`, `hpo_report`,
 `hpo_report_intermediate`, `hpo_best`.
@@ -49,8 +49,9 @@ Optional HPO tools (only with `[hpo]`): `hpo_configure`, `hpo_suggest`, `hpo_rep
 
 - Apply one meaningful change at a time and observe its effect.
 - Mutations apply at bridge safe sync points; read-only interrogations may return sooner.
+- The run **never pauses** for you — your changes land asynchronously (with a small delay) at the next sync
+  point, so telemetry you read is always slightly stale. Account for this lag; don't expect instant effect.
 - Do not invent custom knob/action names. Use `list_knobs` and documented registered handlers.
-- `pause_training` has a bridge-side safety timeout; resume promptly.
 - Treat broker access as privileged because the token can mutate live training.
 
 ## Secondary legacy mode

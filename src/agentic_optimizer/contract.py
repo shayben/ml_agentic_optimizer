@@ -211,9 +211,10 @@ class Command(BaseModel):
     """An action the agent asks the live training run to perform.
 
     ``type`` is a free-form action name. Built-ins handled specially by the bridge:
-    ``set_hyperparameters``, ``pause``, ``resume``, ``set_augmentation``, ``flag_samples``,
-    ``run_evaluation``. Any other ``type`` (or ``set_knob`` / ``invoke`` / ``interrogate``) is routed to a
-    user-registered handler — this is how the agent can influence *anything* in the loop.
+    ``set_hyperparameters``, ``set_augmentation``, ``flag_samples``, ``run_evaluation``. Any other
+    ``type`` (or ``set_knob`` / ``invoke`` / ``interrogate``) is routed to a user-registered handler —
+    this is how the agent can influence *anything* in the loop. All commands are applied
+    asynchronously at the next safe sync point and never pause the loop.
     """
 
     id: str = Field(default_factory=_new_id)
@@ -337,7 +338,6 @@ class Telemetry(BaseModel):
     run_id: str = "default"
     state: TrainingState = Field(default_factory=TrainingState)
     mlflow: MlflowInfo | None = None
-    paused: bool = False
     knobs: list[KnobSpec] = Field(default_factory=list)
     last_error: str | None = None
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)

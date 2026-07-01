@@ -50,13 +50,16 @@ def test_interrogate_returns_data():
     assert client.get_command(cmd.id).result.data["1"] == 0.2
 
 
-def test_pause_then_resume_drained_together():
+def test_on_epoch_end_never_blocks_and_drains():
+    # The bridge must NEVER idle the loop: on_epoch_end pushes telemetry, applies whatever
+    # commands the agent has already enqueued, and returns immediately (influence-with-delay).
     bridge, opt, client = make_bridge()
-    client.enqueue_command("pause", {})
-    client.enqueue_command("resume", {})
-    processed = bridge.on_epoch_end(0, {"val_acc": 0.5})  # applies pause then resume -> no block
-    assert bridge.paused is False
-    assert len(processed) == 2
+    bridge.register("rebalance", lambda args, ctx: {"ok": True})
+    client.enqueue_command("rebalance", {})
+    started = time.monotonic()
+    processed = bridge.on_epoch_end(0, {"val_acc": 0.5})
+    assert time.monotonic() - started < 1.0  # returned without waiting on the agent
+    assert len(processed) == 1
 
 
 def test_flag_samples_accumulates():
@@ -201,14 +204,3 @@ def test_push_telemetry_failure_sets_last_error_without_crashing():
     bridge.push_telemetry({})
 
     assert bridge.last_error is not None
-
-
-def test_max_pause_auto_resumes_within_bound():
-    bridge, opt, client = make_bridge(max_pause_s=0.01, pause_poll_s=0.001)
-    bridge.paused = True
-
-    started = time.monotonic()
-    bridge.on_epoch_end(0, {})
-
-    assert time.monotonic() - started < 1.0
-    assert bridge.paused is False

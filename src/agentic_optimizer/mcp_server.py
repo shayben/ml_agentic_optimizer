@@ -50,7 +50,7 @@ def get_training_state_impl(
     t = client.get_telemetry(_active_run_id(run_id))
     if t is None:
         return {"available": False, "note": "no telemetry pushed yet"}
-    return {"available": True, "paused": t.paused, **t.state.model_dump()}
+    return {"available": True, **t.state.model_dump()}
 
 
 @_safe_impl
@@ -172,16 +172,6 @@ def flag_samples_impl(
     client: ControlPlaneClient, indices: list[int], run_id: str | None = None
 ) -> dict[str, Any]:
     return _enqueue(client, "flag_samples", {"indices": [int(i) for i in indices]}, run_id)
-
-
-@_safe_impl
-def pause_training_impl(client: ControlPlaneClient, run_id: str | None = None) -> dict[str, Any]:
-    return _enqueue(client, "pause", {}, run_id)
-
-
-@_safe_impl
-def resume_training_impl(client: ControlPlaneClient, run_id: str | None = None) -> dict[str, Any]:
-    return _enqueue(client, "resume", {}, run_id)
 
 
 @_safe_impl
@@ -433,7 +423,7 @@ def build_server(client: ControlPlaneClient):
 
     @mcp.tool()
     def get_training_state() -> dict[str, Any]:
-        """Latest training telemetry: step/epoch, loss history, optimizer state, GPU, pause state."""
+        """Latest training telemetry: step/epoch, loss history, optimizer state, GPU utilization."""
         return get_training_state_impl(client)
 
     @mcp.tool()
@@ -519,16 +509,6 @@ def build_server(client: ControlPlaneClient):
     def flag_samples(indices: list[int]) -> dict[str, Any]:
         """Flag dataset sample indices as suspected label noise (the job decides how to use them)."""
         return flag_samples_impl(client, indices)
-
-    @mcp.tool()
-    def pause_training() -> dict[str, Any]:
-        """Pause the training loop at the next safe sync point (resume_training to continue)."""
-        return pause_training_impl(client)
-
-    @mcp.tool()
-    def resume_training() -> dict[str, Any]:
-        """Resume a paused training loop."""
-        return resume_training_impl(client)
 
     @mcp.tool()
     def run_evaluation(args: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -131,8 +131,6 @@ def run_training(
         on_scheduler_reconfig=on_scheduler_reconfig,
         # Guardrails bound any agent LR change to a safe range (out-of-range requests are clamped).
         guardrails={"bounds": {"lr": {"min": 1e-5, "max": 0.5}}},
-        # Label noise makes losses spiky; record anomalies but don't auto-pause this scripted demo.
-        auto_pause_on_anomaly=False,
         checkpoint_dir=checkpoint_dir,
     )
 
@@ -222,7 +220,9 @@ def run_training(
                 f"lr={lr_now:.4f} ls={state['label_smoothing']:.2f} bs={cfg['batch_size']} "
                 f"cmds={len(bridge.processed_commands)}"
             )
-        time.sleep(epoch_pause_s)  # leave room for the agent to interject between epochs
+        # Simulated epoch compute time. The bridge NEVER blocks the loop; this sleep just
+        # stands in for real per-epoch work so the scripted agent has wall-clock time to react.
+        time.sleep(epoch_pause_s)
     bridge.on_train_end()
     if verbose:
         active = int((sample_weights > 0).sum().item())

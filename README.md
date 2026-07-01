@@ -10,9 +10,11 @@ diagnose training, and interject mid-run: tune optimizer
 hyperparameters, adjust throughput/hardware settings, queue data/model interrogations, flag suspicious samples,
 and drive optional HPO.
 
-**What the agent can do to a live run, without restarting it:**
+**What the agent can do to a live run, without restarting it** (and **without ever pausing it** — the loop
+never idles waiting on the agent; every change is applied asynchronously at the next safe sync point, so the
+agent always acts on *slightly stale* telemetry and its influence lands **with a small delay**):
 
-- **Observe** — step/epoch, loss history, gradient norm, throughput, GPU memory & utilization, pause state,
+- **Observe** — step/epoch, loss history, gradient norm, throughput, GPU memory & utilization,
   `last_error`, anomalies, scheduler state, a step-time profile, and MLflow run linkage.
 - **Tune the optimizer** — `lr`, `weight_decay`, `momentum`, `grad_clip` (bounded by **guardrails**).
 - **Steer hardware/throughput** — `batch_size`, `num_workers`, `grad_accum_steps`, `amp` (via your callback).
@@ -21,7 +23,7 @@ and drive optional HPO.
 - **Fix data & robustness** — pull the highest per-sample losses and flag likely label noise to down-weight or
   filter, and toggle data augmentation mid-run (`set_augmentation`).
 - **Train safely** — **checkpoint + rollback** a bad change, **guardrails** clamp unsafe hyperparameters, and
-  **anomaly auto-pause** halts on NaN/Inf/grad-explosion.
+  **anomaly detection** surfaces NaN/Inf/grad-explosion the moment it happens.
 - **Profile** — a built-in step-time breakdown (data-wait vs forward vs backward) for throughput RCA.
 - **Manage the run** — graceful `stop_training` (free the GPU) and `extend_training` (raise `max_epochs`).
 - **Search** — an optional **Optuna** advisor the agent layers root-cause reasoning on top of.
@@ -80,7 +82,7 @@ The remote node does **not** need FastAPI, uvicorn, MCP, or the Copilot CLI.
 Observe and control: `get_training_state`, `get_metrics`, `get_mlflow_info`, `list_knobs`, `list_runs`,
 `select_run`, `set_hyperparameters`, `set_training_config`, `set_knob`, `invoke`, `interrogate`,
 `invoke_and_wait`, `interrogate_and_wait`, `get_suspicious_samples`, `flag_samples`, `set_augmentation`,
-`run_evaluation`, `pause_training`, `resume_training`, and `wait_for_result`.
+`run_evaluation`, and `wait_for_result`.
 
 Safe live control and lifecycle: `save_checkpoint`, `restore_checkpoint`, `list_checkpoints`, `set_guardrails`,
 `get_profile`, `get_scheduler`, `set_scheduler`, `get_anomalies`, `stop_training`, and `extend_training`.
@@ -175,7 +177,6 @@ bridge = TrainingBridge(
     scheduler=scheduler,                       # exposed via get_scheduler / set_scheduler
     mlflow=True,
     poll_interval=1.0,                         # optional background poller for prompt command pickup
-    auto_pause_on_anomaly=True,                # halt on NaN/Inf/grad-explosion
     guardrails={"bounds": {"lr": {"min": 1e-5, "max": 0.5}}, "max_rel_change": 10.0},
     checkpoint_dir="ckpts",                    # enables save_checkpoint / restore_checkpoint rollback
     on_scheduler_reconfig=lambda args: build_scheduler(optimizer, **args),
@@ -240,12 +241,14 @@ Patterns the agent (and `agent_sim.py`) follow — inspect first, change one thi
 | Need a principled search | — | `hpo_configure` → `hpo_suggest` → apply → `hpo_report` | `hpo_best` |
 
 Mutations apply at the bridge's safe sync points; read-only interrogations registered `safe_async=True` can
-return sooner. **Guardrails** clamp out-of-range hyperparameters, and **anomaly auto-pause** can halt the run on
-NaN/Inf/grad-explosion. Use `wait_for_result(command_id)` to confirm a queued change was applied.
+return sooner. The loop **never pauses** for the agent — changes land asynchronously (with a small delay) at the
+next sync point, so the agent always acts on slightly stale telemetry. **Guardrails** clamp out-of-range
+hyperparameters, and **anomaly detection** surfaces NaN/Inf/grad-explosion (via `get_anomalies` / `last_error`)
+without ever halting the run. Use `wait_for_result(command_id)` to confirm a queued change was applied.
 
 ## What the agent sees
 
-`get_training_state` returns the latest `Telemetry` for a run: `run_id`, `paused`, `last_error`, advertised
+`get_training_state` returns the latest `Telemetry` for a run: `run_id`, `last_error`, advertised
 `knobs`, optional `mlflow` linkage, recorded `anomalies` and `checkpoints`, optional `distributed` (rank/world)
 info, and a `state` snapshot with `step`/`epoch`/`max_epochs`, recent `loss_history`, `metrics`,
 per-`param_groups` `lr`/`weight_decay`/`momentum`, `grad_norm`, `throughput_samples_per_s`, `gpu` (`device`,

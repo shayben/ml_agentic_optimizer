@@ -52,11 +52,9 @@ def test_wait_for_result_times_out_when_unhandled():
     assert res["ready"] is False
 
 
-def test_invoke_and_pause_resume_impls():
+def test_invoke_and_flag_augment_impls():
     c = _client()
     assert ms.invoke_impl(c, "rebalance", {"ratio": 0.5})["type"] == "invoke"
-    assert ms.pause_training_impl(c)["type"] == "pause"
-    assert ms.resume_training_impl(c)["type"] == "resume"
     assert ms.flag_samples_impl(c, [1, 2])["type"] == "flag_samples"
     assert ms.set_augmentation_impl(c, True)["type"] == "set_augmentation"
 

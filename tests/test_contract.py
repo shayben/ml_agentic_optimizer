@@ -62,7 +62,7 @@ def test_v2_runid_and_lease_defaults():
     assert Telemetry().run_id == "default"
     assert Telemetry().last_error is None
     assert CommandRequest(type="set_knob").run_id == "default"
-    cmd = Command(type="pause")
+    cmd = Command(type="set_hyperparameters")
     assert cmd.run_id == "default"
     assert cmd.attempts == 0
     assert cmd.lease_expires_at is None
