@@ -561,6 +561,27 @@ class ControlPlaneClient:
             return False
 
 
+def _check_exposure(*, token: str | None, tunnel: bool, host: str, insecure: bool) -> None:
+    """Refuse to expose an unauthenticated control plane.
+
+    A Dev Tunnel is always a public endpoint and a non-loopback bind is reachable off-box;
+    either one without a bearer token lets anyone drive the training run. Require
+    ``CONTROL_PLANE_TOKEN`` in those cases unless the operator explicitly opts out with
+    ``CONTROL_PLANE_INSECURE=1``. Raises :class:`SystemExit` to abort startup."""
+    if token or insecure:
+        return
+    if tunnel:
+        raise SystemExit(
+            "Refusing to expose an unauthenticated control plane over a public Dev Tunnel. "
+            "Set CONTROL_PLANE_TOKEN (recommended) or CONTROL_PLANE_INSECURE=1 to override."
+        )
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise SystemExit(
+            "Refusing to bind an unauthenticated control plane to a non-loopback host. "
+            "Set CONTROL_PLANE_TOKEN or CONTROL_PLANE_INSECURE=1 to override."
+        )
+
+
 def _run_cli() -> None:  # pragma: no cover - thin console entry point
     """``agentic-optimizer-broker`` console script: serve the broker from env config."""
     import argparse
@@ -579,12 +600,12 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
     host = args.host
     port = args.port
     token = os.environ.get("CONTROL_PLANE_TOKEN")
-    if not args.tunnel and not token and os.environ.get("CONTROL_PLANE_INSECURE") != "1":
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise SystemExit(
-                "Refusing to bind unauthenticated control plane to a non-loopback host. "
-                "Set CONTROL_PLANE_TOKEN or CONTROL_PLANE_INSECURE=1 to override."
-            )
+    _check_exposure(
+        token=token,
+        tunnel=args.tunnel,
+        host=host,
+        insecure=os.environ.get("CONTROL_PLANE_INSECURE") == "1",
+    )
     persist_path = os.environ.get("CONTROL_PLANE_PERSIST")
     max_body_bytes = int(os.environ.get("CONTROL_PLANE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
     app = create_app(

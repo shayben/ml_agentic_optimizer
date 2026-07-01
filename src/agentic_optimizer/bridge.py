@@ -203,6 +203,7 @@ class TrainingBridge:
         self._win_samples = 0
         self._susp: dict[int, float] = {}
         self._deferred: list[Command] = []
+        self._pending_flag_indices: list[list[int]] = []
         self._dlock = threading.Lock()
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
@@ -297,7 +298,12 @@ class TrainingBridge:
         self.flagged_indices.update(indices)
         new_indices = sorted(self.flagged_indices - before)
         if new_indices and self.on_flagged_samples is not None:
-            self.on_flagged_samples(new_indices)
+            # flag_samples runs on the poller thread (it is safe_async so the flag registers
+            # immediately), but the user callback typically mutates shared training tensors
+            # (e.g. zeroing sample weights). Defer it to the next sync point so it runs on the
+            # training thread instead of racing it. drain_commands flushes the queue.
+            with self._dlock:
+                self._pending_flag_indices.append(new_indices)
         return {"flagged_now": len(indices), "flagged_total": len(self.flagged_indices)}
 
     def _h_run_evaluation(self, args: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
@@ -383,6 +389,11 @@ class TrainingBridge:
         import uuid
 
         cid = checkpoint_id or uuid.uuid4().hex[:12]
+        # Re-saving an existing id must move it to the most-recently-saved position: a plain
+        # dict update keeps the original insertion order, which would make restore-latest and
+        # eviction target the wrong checkpoint. Pop first so the re-insert appends at the end.
+        self._checkpoints.pop(cid, None)
+        self._ckpt_blobs.pop(cid, None)
         blob: dict[str, Any] = {"step": self.step, "epoch": self.epoch}
         for name, obj in (
             ("model", self.model),
@@ -692,7 +703,9 @@ class TrainingBridge:
         # In distributed mode, only rank 0 talks to the broker; mutations are then
         # broadcast to the other ranks so every replica applies the same change.
         if dist.is_available() and not dist.is_main_process():
-            return self._apply_replicated_commands()
+            applied = self._apply_replicated_commands()
+            self._flush_flag_callbacks()
+            return applied
         processed: list[Command] = []
         if self._poll_thread is not None or self._deferred:
             with self._dlock:
@@ -715,7 +728,22 @@ class TrainingBridge:
             processed.append(cmd)
             self.processed_commands.append(cmd)
         self._broadcast_processed(processed)
+        self._flush_flag_callbacks()
         return processed
+
+    def _flush_flag_callbacks(self) -> None:
+        """Run any deferred ``on_flagged_samples`` callbacks on the calling (training) thread.
+
+        ``flag_samples`` registers the flag immediately on the poller thread, but its callback
+        usually mutates shared tensors, so it is queued here and applied at a training-thread
+        sync point (drain) to avoid racing the loop."""
+        if self.on_flagged_samples is None:
+            return
+        with self._dlock:
+            pending = self._pending_flag_indices
+            self._pending_flag_indices = []
+        for indices in pending:
+            self.on_flagged_samples(indices)
 
     def _resolve(self, cmd: Command) -> tuple[Handler, dict[str, Any]]:
         t = cmd.type

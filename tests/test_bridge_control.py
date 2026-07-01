@@ -139,6 +139,34 @@ def test_checkpoint_eviction_respects_max_checkpoints():
     assert set(bridge._checkpoints) == {"b", "c"}
 
 
+def test_resaving_existing_id_moves_it_to_latest():
+    """Re-saving an id must move it to the most-recent position so restore-latest picks it up,
+    rather than the entry that merely has the newest content but the oldest insertion slot."""
+    model = FakeModule(val=1.0)
+    bridge, opt, client = make_bridge(model=model)
+    bridge.save_checkpoint(checkpoint_id="a")  # val=1.0
+    model.val = 2.0
+    bridge.save_checkpoint(checkpoint_id="b")  # val=2.0
+    model.val = 3.0
+    bridge.save_checkpoint(checkpoint_id="a")  # re-save "a"; it becomes the latest
+    model.val = 99.0
+
+    client.enqueue_command("restore_checkpoint", {})  # no id -> latest
+    bridge.drain_commands()
+    assert model.val == 3.0  # the re-saved "a", not "b"
+    assert list(bridge._checkpoints) == ["b", "a"]
+
+
+def test_resaving_existing_id_updates_eviction_order():
+    """A re-save also refreshes eviction order so the just-touched id is not the next evicted."""
+    bridge, opt, client = make_bridge(model=FakeModule(), max_checkpoints=2)
+    bridge.save_checkpoint(checkpoint_id="a")
+    bridge.save_checkpoint(checkpoint_id="b")
+    bridge.save_checkpoint(checkpoint_id="a")  # refresh "a" -> "b" is now oldest
+    bridge.save_checkpoint(checkpoint_id="c")  # evicts the oldest ("b")
+    assert set(bridge._checkpoints) == {"a", "c"}
+
+
 def test_checkpoint_disk_roundtrip(tmp_path):
     pytest.importorskip("torch")  # the disk path uses torch.save/torch.load
     model = FakeModule(val=3.0)

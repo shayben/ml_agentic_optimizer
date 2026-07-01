@@ -8,6 +8,7 @@ from agentic_optimizer.contract import CommandResult, CommandStatus, KnobSpec, T
 from agentic_optimizer.controlplane import (
     ControlPlaneClient,
     ControlPlaneStore,
+    _check_exposure,
     create_app,
 )
 
@@ -159,6 +160,30 @@ def test_constant_time_auth_correct_wrong_and_missing():
     assert good.get_telemetry() is not None
     assert wrong._client.get("/telemetry/latest").status_code == 401
     assert missing._client.get("/telemetry/latest").status_code == 401
+
+
+# ------------------------------------------------------------------ exposure guard
+def test_check_exposure_refuses_unauthenticated_tunnel():
+    with pytest.raises(SystemExit):
+        _check_exposure(token=None, tunnel=True, host="127.0.0.1", insecure=False)
+
+
+def test_check_exposure_refuses_unauthenticated_non_loopback():
+    with pytest.raises(SystemExit):
+        _check_exposure(token=None, tunnel=False, host="0.0.0.0", insecure=False)
+
+
+def test_check_exposure_allows_loopback_without_token():
+    for host in ("127.0.0.1", "localhost", "::1"):
+        _check_exposure(token=None, tunnel=False, host=host, insecure=False)
+
+
+def test_check_exposure_token_permits_tunnel_and_non_loopback():
+    _check_exposure(token="secret", tunnel=True, host="0.0.0.0", insecure=False)
+
+
+def test_check_exposure_insecure_optout_permits_exposure():
+    _check_exposure(token=None, tunnel=True, host="0.0.0.0", insecure=True)
 
 
 def test_max_body_413():

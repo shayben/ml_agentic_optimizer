@@ -159,6 +159,22 @@ def test_flag_samples_hook_receives_new_indices():
     assert bridge.flagged_indices == {1, 2, 3}
 
 
+def test_flag_samples_callback_deferred_from_poller_to_drain():
+    """flag_samples registers the indices immediately on the poller thread, but the
+    user callback (which typically mutates shared training tensors) must be deferred to the
+    training thread's next drain so it cannot race the loop."""
+    seen = []
+    bridge, opt, client = make_bridge(on_flagged_samples=seen.append)
+    client.enqueue_command("flag_samples", {"indices": [5, 6]})
+
+    assert bridge._poll_once() == 1  # poller thread applies the safe command
+    assert bridge.flagged_indices == {5, 6}  # metadata registered immediately
+    assert seen == []  # ...but the tensor-mutating callback has NOT run yet
+
+    bridge.drain_commands()  # training-thread sync point
+    assert seen == [[5, 6]]  # callback runs here, on the training thread
+
+
 def test_poll_once_executes_safe_and_defers_mutation_until_drain():
     bridge, opt, client = make_bridge()
     bridge.register("read_lr", lambda args, ctx: {"lr": ctx.optimizer.param_groups[0]["lr"]}, safe_async=True)
