@@ -277,6 +277,26 @@ namespaced by it, so many training jobs can share one broker. The agent calls `l
   `--tunnel-id <id>` or `CONTROL_PLANE_TUNNEL_ID=<id>` to ensure and host a persistent named tunnel whose HTTPS URL
   stays stable across broker restarts.
 
+### Where the broker runs: two topologies
+
+The broker, the Dev Tunnel, and the training bridge are transport-symmetric, so the broker can run on **either**
+side:
+
+- **Agent-hosted (default).** Run `agentic-optimizer-broker --tunnel` on your local box; the AML job dials out to
+  the tunnel URL as its `CONTROL_PLANE_URL` (see [`examples/aml_job.yml`](examples/aml_job.yml)). Best when one
+  broker should aggregate many jobs, or you don't want to provision Dev Tunnels credentials on the cluster. The
+  broker must be up before the job connects.
+- **Node-hosted (submit-then-attach).** The job hosts the broker + tunnel itself (see
+  [`examples/selfhost_and_train.py`](examples/selfhost_and_train.py) and
+  [`examples/aml_job_selfhost.yml`](examples/aml_job_selfhost.yml)). The bridge talks to the broker over
+  **loopback** and the node publishes a public URL the local agent connects *into*. You submit the job first and
+  **attach whenever** — telemetry buffers on the node until the agent opts in — and the control plane keeps running
+  even if your local box sleeps. Hosting a tunnel requires the host to be authenticated (`--allow-anonymous` only
+  grants *clients* access), so a headless node needs non-interactive login via `--tunnel-login` /
+  `CONTROL_PLANE_TUNNEL_LOGIN` (e.g. an access-token wrapper). The discovered URL is written to `--tunnel-url-file`
+  / `CONTROL_PLANE_TUNNEL_URL_FILE`; with a persistent `--tunnel-id` the URL is deterministic, so the agent's MCP
+  config stays static.
+
 ## Containers
 
 See [`docker/`](docker/) for separate broker and training-node images. The old single “Copilot CLI on the node”

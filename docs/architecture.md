@@ -146,6 +146,21 @@ the tunnel is internet-reachable. By default the tunnel is temporary and its URL
 (`https://<id>-<port>.<cluster>.devtunnels.ms`) so `CONTROL_PLANE_URL` and the MCP config stay static across
 broker restarts.
 
+### Two topologies (who hosts the broker)
+
+The broker, tunnel, and bridge are transport-symmetric, so the broker can run on either side:
+
+- **Agent-hosted (default).** The broker + tunnel run on the local box; the training job dials out to the tunnel
+  URL. The agent↔broker hop is loopback. Good for aggregating many jobs into one broker. The broker must exist
+  before the job connects (`examples/aml_job.yml`).
+- **Node-hosted (submit-then-attach).** The broker + tunnel run *on the training node*
+  (`examples/selfhost_and_train.py`); the bridge↔broker hop is loopback and the agent connects in over the tunnel.
+  The job self-publishes, so you submit first and attach later, telemetry buffers on the node until the agent opts
+  in, and the control plane survives the local box sleeping. Hosting a tunnel requires the host to authenticate
+  (anonymous access is client-only), so a headless node uses a non-interactive login hook
+  (`tunnel.run_login`, wired via `--tunnel-login` / `CONTROL_PLANE_TUNNEL_LOGIN`). The discovered URL can be
+  written to `--tunnel-url-file` for cross-machine discovery (`examples/aml_job_selfhost.yml`).
+
 The broker stores telemetry and small command/result payloads, not model weights. Custom interrogation handlers
 decide what data/model details are exposed; keep results free of sensitive raw data.
 

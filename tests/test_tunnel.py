@@ -14,6 +14,7 @@ from agentic_optimizer.tunnel import (
     devtunnel_available,
     ensure_named_tunnel,
     parse_tunnel_url,
+    run_login,
 )
 
 
@@ -202,6 +203,116 @@ def test_dev_tunnel_named_start_ensures_then_hosts_stable_url() -> None:
         ("run", ["devtunnel", "port", "create", "stable-id", "-p", "8765"]),
         ("popen", ["devtunnel", "host", "stable-id", "--allow-anonymous"]),
     ]
+
+
+def test_run_login_runs_command() -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    run_login(["devtunnel", "user", "login", "-g", "-d"], run=run)
+
+    assert calls == [["devtunnel", "user", "login", "-g", "-d"]]
+
+
+def test_run_login_noop_when_empty() -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("run should not be called for an empty login command")
+
+    run_login([], run=run)  # no exception, no call
+
+
+def test_run_login_raises_on_failure() -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="auth boom")
+
+    with pytest.raises(TunnelError, match="auth boom"):
+        run_login(["devtunnel", "login"], run=run)
+
+
+def test_dev_tunnel_runs_login_before_temp_host() -> None:
+    events: list[tuple[str, list[str]]] = []
+    fake_proc = FakeProcess(
+        FakeStdout(["Connect via browser: https://abc-8765.usw2.devtunnels.ms\n"])
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        events.append(("run", argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        events.append(("popen", argv))
+        return fake_proc
+
+    dev_tunnel = DevTunnel(
+        8765, login_cmd=["devtunnel", "login", "-g", "-d"], popen=popen, run=run, timeout=1
+    )
+
+    assert dev_tunnel.start() == "https://abc-8765.usw2.devtunnels.ms"
+    assert events == [
+        ("run", ["devtunnel", "login", "-g", "-d"]),
+        ("popen", ["devtunnel", "host", "-p", "8765", "--allow-anonymous"]),
+    ]
+
+
+def test_dev_tunnel_named_start_logs_in_then_ensures_then_hosts() -> None:
+    events: list[tuple[str, list[str]]] = []
+    fake_proc = FakeProcess(
+        FakeStdout(["Connect via browser: https://stable-id.devtunnels.ms\n"])
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        events.append(("run", argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        events.append(("popen", argv))
+        return fake_proc
+
+    dev_tunnel = DevTunnel(
+        8765, tunnel_id="stable-id", login_cmd=["devtunnel", "login"], popen=popen, run=run, timeout=1
+    )
+
+    assert dev_tunnel.start() == "https://stable-id.devtunnels.ms"
+    assert events == [
+        ("run", ["devtunnel", "login"]),
+        ("run", ["devtunnel", "create", "stable-id", "--allow-anonymous"]),
+        ("run", ["devtunnel", "port", "create", "stable-id", "-p", "8765"]),
+        ("popen", ["devtunnel", "host", "stable-id", "--allow-anonymous"]),
+    ]
+
+
+def test_dev_tunnel_invokes_on_url_with_public_url() -> None:
+    seen: list[str] = []
+    fake_proc = FakeProcess(
+        FakeStdout(["Connect via browser: https://abc-8765.usw2.devtunnels.ms\n"])
+    )
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        return fake_proc
+
+    dev_tunnel = DevTunnel(8765, popen=popen, on_url=seen.append, timeout=1)
+
+    assert dev_tunnel.start() == "https://abc-8765.usw2.devtunnels.ms"
+    assert seen == ["https://abc-8765.usw2.devtunnels.ms"]
+
+
+def test_dev_tunnel_on_url_exception_does_not_break_start() -> None:
+    fake_proc = FakeProcess(
+        FakeStdout(["Connect via browser: https://abc-8765.usw2.devtunnels.ms\n"])
+    )
+
+    def popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        return fake_proc
+
+    def boom(url: str) -> None:
+        raise RuntimeError("callback fail")
+
+    dev_tunnel = DevTunnel(8765, popen=popen, on_url=boom, timeout=1)
+
+    assert dev_tunnel.start() == "https://abc-8765.usw2.devtunnels.ms"
 
 
 def test_dev_tunnel_start_raises_when_process_exits_without_url() -> None:

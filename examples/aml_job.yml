@@ -6,6 +6,9 @@
 # - This AML job runs only the PyTorch training process + TrainingBridge and points it at the broker.
 # - The local GitHub Copilot CLI connects to the same broker through agent/mcp-config.json.
 # - Legacy file-contract / on-node agent examples are secondary; do not run Copilot CLI in this job.
+#
+# This is "Topology A" (agent-hosted broker). For "submit-then-attach", where the job hosts the broker
+# and Dev Tunnel itself and the agent connects IN, see examples/aml_job_selfhost.yml.
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 display_name: agentic-optimizer-bridge

@@ -121,8 +121,10 @@ entry point — see the conventions below.
 - Local + node clients: `CONTROL_PLANE_URL`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_RUN_ID`.
 - Broker: `CONTROL_PLANE_HOST`, `CONTROL_PLANE_PORT`, `CONTROL_PLANE_TOKEN`, `CONTROL_PLANE_PERSIST`,
   `CONTROL_PLANE_MAX_BODY_BYTES`, `CONTROL_PLANE_INSECURE=1`, `CONTROL_PLANE_TUNNEL_ID` (persistent named Dev
-  Tunnel → stable public URL for `--tunnel`, so the node/MCP config stays static across restarts). Broker startup
-  (`controlplane._check_exposure`)
+  Tunnel → stable public URL for `--tunnel`, so the node/MCP config stays static across restarts),
+  `CONTROL_PLANE_TUNNEL_LOGIN` (non-interactive Dev Tunnels host login for node-hosted mode; anonymous access is
+  client-only so a headless host must authenticate) and `CONTROL_PLANE_TUNNEL_URL_FILE` (write the discovered
+  public URL for cross-machine discovery). Broker startup (`controlplane._check_exposure`)
   **refuses** to serve an unauthenticated control plane over a public `--tunnel` **or** a non-loopback bind
   (anyone reachable could drive the run); set `CONTROL_PLANE_TOKEN`, or `CONTROL_PLANE_INSECURE=1` to override
   (unsafe). A loopback bind with no token is allowed.
@@ -136,4 +138,6 @@ entry point — see the conventions below.
 `callback.py`/`driver.py` (legacy). Runnable `examples/` (`run_broker.py`, `minimal_bridge.py` = 3-line `attach`
 demo, `train_with_bridge.py`, `agent_sim.py`, `live_demo.py`; `cifar10_resnet.py` = the legacy
 `AgenticCallback`/driver `state.json`/`control.json` demo, runs offline with `--fake-data`; `aml_job.yml` = an
-Azure ML job spec). Docs in `README.md`, `docs/`, `agent/`, `docker/`, `auth/`.
+Azure ML job spec [agent-hosted broker], `selfhost_and_train.py` + `aml_job_selfhost.yml` = node-hosted
+"submit-then-attach" broker+tunnel on the training node). Docs in `README.md`, `docs/`, `agent/`, `docker/`,
+`auth/`.

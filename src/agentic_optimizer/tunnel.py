@@ -75,6 +75,32 @@ def _already_exists(result: subprocess.CompletedProcess[str]) -> bool:
     return result.returncode != 0 and "already exists" in output.lower()
 
 
+def run_login(
+    login_cmd: list[str],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Run a non-interactive Dev Tunnels *host* login (for headless hosts such as an AML node).
+
+    Hosting a tunnel — even an anonymous-access one — requires the host to be authenticated to the
+    Dev Tunnels service (``--allow-anonymous`` only grants *client* access). On your local box you are
+    already logged in, but a remote training node is not. ``login_cmd`` is the command that
+    authenticates it, e.g. an access-token wrapper or ``devtunnel user login -g -d``; it must be
+    non-interactive (return promptly) to be usable in an automated job.
+    """
+    if not login_cmd:
+        return
+    logger.info("Authenticating Dev Tunnels host: %s", " ".join(login_cmd))
+    try:
+        result = run(login_cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise TunnelError(f"Dev Tunnels login command failed to start: {exc}") from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise TunnelError(f"Dev Tunnels login failed ({' '.join(login_cmd)}){detail}")
+
+
 def parse_tunnel_url(line: str) -> str | None:
     """Extract the first public ``https://*.devtunnels.ms`` URL from a devtunnel line."""
     match = _DEV_TUNNEL_URL_RE.search(line)
@@ -93,6 +119,8 @@ class DevTunnel:
         allow_anonymous: bool = True,
         cmd: str = "devtunnel",
         tunnel_id: str | None = None,
+        login_cmd: list[str] | None = None,
+        on_url: Callable[[str], None] | None = None,
         popen: Callable[..., Any] = subprocess.Popen,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout: float = 30.0,
@@ -101,6 +129,8 @@ class DevTunnel:
         self.allow_anonymous = allow_anonymous
         self.cmd = cmd
         self.tunnel_id = tunnel_id
+        self.login_cmd = login_cmd
+        self.on_url = on_url
         self.popen = popen
         self.run = run
         self.timeout = timeout
@@ -116,6 +146,9 @@ class DevTunnel:
                 "Install it from https://learn.microsoft.com/azure/developer/dev-tunnels/ "
                 "or pass --devtunnel-cmd with the CLI path."
             )
+
+        if self.login_cmd:
+            run_login(self.login_cmd, run=self.run)
 
         if self.tunnel_id is not None:
             ensure_named_tunnel(
@@ -178,6 +211,7 @@ class DevTunnel:
             if url is not None:
                 self.url = url
                 self._startup_done.set()
+                self._emit_url(url)
                 return url
 
     def stop(self) -> None:
@@ -207,6 +241,14 @@ class DevTunnel:
         """Stop the tunnel when leaving a context manager."""
         self.stop()
 
+    def _emit_url(self, url: str) -> None:
+        if self.on_url is None:
+            return
+        try:
+            self.on_url(url)
+        except Exception:
+            logger.warning("Dev Tunnel on_url callback raised", exc_info=True)
+
     def _read_stdout(self, stdout: IO[str], lines: queue.Queue[str | None]) -> None:
         try:
             for line in stdout:
@@ -234,9 +276,22 @@ def serve_with_tunnel(
     cmd: str = "devtunnel",
     tunnel_id: str | None = None,
     allow_anonymous: bool = True,
+    login_cmd: list[str] | None = None,
+    on_url: Callable[[str], None] | None = None,
 ) -> None:  # pragma: no cover - thin server wrapper
-    """Serve the broker with a Microsoft Dev Tunnel forwarding public HTTPS traffic."""
-    tunnel = DevTunnel(port, cmd=cmd, tunnel_id=tunnel_id, allow_anonymous=allow_anonymous)
+    """Serve the broker with a Microsoft Dev Tunnel forwarding public HTTPS traffic.
+
+    ``login_cmd`` authenticates a headless host (node-hosted mode); ``on_url`` receives the public URL
+    once discovered (e.g. to write it to a file for cross-machine discovery).
+    """
+    tunnel = DevTunnel(
+        port,
+        cmd=cmd,
+        tunnel_id=tunnel_id,
+        allow_anonymous=allow_anonymous,
+        login_cmd=login_cmd,
+        on_url=on_url,
+    )
     try:
         url = tunnel.start()
         logger.info("Dev Tunnel public URL: %s", url)

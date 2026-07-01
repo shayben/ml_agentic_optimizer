@@ -19,6 +19,7 @@ import asyncio
 import hmac
 import logging
 import os
+import shlex
 import sqlite3
 import threading
 import time
@@ -602,6 +603,21 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
         "CONTROL_PLANE_URL stays constant across broker restarts (no config churn). "
         "Defaults to $CONTROL_PLANE_TUNNEL_ID. Requires --tunnel.",
     )
+    parser.add_argument(
+        "--tunnel-login",
+        default=os.environ.get("CONTROL_PLANE_TUNNEL_LOGIN"),
+        help="Non-interactive Dev Tunnels login command run before hosting (node-hosted mode: a "
+        "headless node must authenticate to HOST a tunnel; --allow-anonymous only grants clients). "
+        "E.g. an access-token wrapper or 'devtunnel user login -g -d'. Defaults to "
+        "$CONTROL_PLANE_TUNNEL_LOGIN. Requires --tunnel.",
+    )
+    parser.add_argument(
+        "--tunnel-url-file",
+        default=os.environ.get("CONTROL_PLANE_TUNNEL_URL_FILE"),
+        help="Write the discovered public Dev Tunnel URL to this path so a remote agent can "
+        "discover it (e.g. an AML outputs folder). Defaults to $CONTROL_PLANE_TUNNEL_URL_FILE. "
+        "Requires --tunnel.",
+    )
     args = parser.parse_args()
 
     host = args.host
@@ -617,6 +633,10 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
         logger.warning(
             "--tunnel-id/$CONTROL_PLANE_TUNNEL_ID is ignored without --tunnel; "
             "add --tunnel to host the persistent Dev Tunnel."
+        )
+    if (args.tunnel_login or args.tunnel_url_file) and not args.tunnel:
+        logger.warning(
+            "--tunnel-login/--tunnel-url-file are ignored without --tunnel."
         )
     persist_path = os.environ.get("CONTROL_PLANE_PERSIST")
     max_body_bytes = int(os.environ.get("CONTROL_PLANE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
@@ -648,7 +668,30 @@ def _run_cli() -> None:  # pragma: no cover - thin console entry point
                 "Temporary Dev Tunnel: the public URL changes each run. Pass --tunnel-id "
                 "(or $CONTROL_PLANE_TUNNEL_ID) for a stable URL."
             )
-        serve_with_tunnel(app, tunnel_host, port, cmd=args.devtunnel_cmd, tunnel_id=args.tunnel_id)
+
+        login_cmd = shlex.split(args.tunnel_login) if args.tunnel_login else None
+        url_file = args.tunnel_url_file
+
+        def _on_url(url: str) -> None:
+            if not url_file:
+                return
+            try:
+                path = Path(url_file)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(url + "\n", encoding="utf-8")
+                logger.info("Wrote Dev Tunnel public URL to %s", url_file)
+            except OSError:
+                logger.warning("Failed to write Dev Tunnel URL to %s", url_file, exc_info=True)
+
+        serve_with_tunnel(
+            app,
+            tunnel_host,
+            port,
+            cmd=args.devtunnel_cmd,
+            tunnel_id=args.tunnel_id,
+            login_cmd=login_cmd,
+            on_url=_on_url,
+        )
         return
 
     logger.info("control plane on http://%s:%s (auth: %s)", host, port, "on" if token else "off")

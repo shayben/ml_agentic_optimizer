@@ -1,0 +1,50 @@
+# Azure ML v2 command job for the NODE-HOSTED "submit-then-attach" topology (Topology B).
+# Submit with: az ml job create -f examples/aml_job_selfhost.yml
+#
+# Unlike aml_job.yml (which dials OUT to a broker you host elsewhere), this job hosts the broker
+# AND the Dev Tunnel on the training node, so:
+# - you submit the job first and attach the local agent LATER (no ordering constraint);
+# - the TrainingBridge talks to the broker over loopback (no internet hop for telemetry);
+# - the node self-publishes a public HTTPS URL that the local GitHub Copilot CLI connects INTO.
+#
+# The local agent's agent/mcp-config.json sets CONTROL_PLANE_URL to the tunnel's public URL. With a
+# persistent --tunnel-id the URL is stable, so that config never changes across runs.
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+display_name: agentic-optimizer-selfhost
+experiment_name: agentic-optimizer
+
+# Use docker/Dockerfile.node (which must include the `devtunnel` CLI) pushed to your registry.
+environment: azureml:agentic-optimizer-node@latest
+
+code: ..
+compute: azureml:gpu-cluster
+
+# selfhost_and_train.py starts the broker + Dev Tunnel on the node, waits for it to be healthy, then
+# trains with the bridge pointed at loopback. The public URL is written to the outputs folder.
+command: >-
+  pip install -e ".[torch,gpu,mlflow,broker]" &&
+  python examples/selfhost_and_train.py --epochs 30
+
+environment_variables:
+  # The tunnel is public, so a bearer token is REQUIRED. Store it in an AML/Key Vault secret.
+  CONTROL_PLANE_TOKEN: ${{secrets.control-plane-token}}
+  CONTROL_PLANE_RUN_ID: aml-run-001
+
+  # Persistent named tunnel -> STABLE public URL (https://<id>-8765.<cluster>.devtunnels.ms).
+  # Create the id once so its cluster/URL is fixed, then reuse it here and in agent/mcp-config.json.
+  CONTROL_PLANE_TUNNEL_ID: agentic-optimizer-CHANGE-ME
+
+  # Non-interactive Dev Tunnels HOST authentication (headless nodes cannot open a browser).
+  # --allow-anonymous only grants CLIENT access; the host must still be logged in. Provide an
+  # access-token wrapper or, for a semi-attended run, a device-code login you complete once:
+  #   CONTROL_PLANE_TUNNEL_LOGIN: "devtunnel user login -g -d"
+  CONTROL_PLANE_TUNNEL_LOGIN: ${{secrets.devtunnel-login-command}}
+
+  # Publish the discovered public URL so you can grab it from the job's outputs and paste it into
+  # the agent's CONTROL_PLANE_URL (not needed if you rely on the deterministic --tunnel-id URL).
+  CONTROL_PLANE_TUNNEL_URL_FILE: ${{outputs.outputs}}/tunnel_url.txt
+
+outputs:
+  outputs:
+    type: uri_folder
